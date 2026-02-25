@@ -1,0 +1,220 @@
+services:
+  # 1. External Bank Simulation (FastAPI)
+  external_bank:
+    build: ./external_bank
+    container_name: external_bank_api
+    env_file: .env
+    volumes:
+      - ./external_bank/database:/app/database
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      teamsec_network:
+        aliases:
+          - external-bank-api
+
+  # 2. System Database (PostgreSQL)
+  postgres_db:
+    image: postgres:15
+    container_name: postgres_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-teamsec_db}
+      POSTGRES_USER: ${POSTGRES_USER:-teamsec_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-teamsec_pg_pass_2026}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U teamsec_user -d teamsec_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - teamsec_network
+
+  # 3. Message Broker (Redis)
+  redis:
+    image: redis:7-alpine
+    container_name: redis_broker
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - teamsec_network
+
+  # 4. Data Warehouse (ClickHouse)
+  clickhouse:
+    image: clickhouse/clickhouse-server
+    container_name: clickhouse_dw
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./monitoring/clickhouse/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9363:9363"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      teamsec_network:
+        aliases:
+          - clickhouse-dw
+
+  # 5. SaaS Adapter & API (Django)
+  adapter_api:
+    build: ./api
+    container_name: django_adapter
+    env_file: .env
+    volumes:
+      - ./api:/app
+      - ./adapter:/app/adapter
+      - static_files:/app/staticfiles
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
+      - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      external_bank:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      teamsec_network:
+        aliases:
+          - adapter-api
+
+  # 6. Celery Worker
+  celery_worker:
+    build: ./api
+    container_name: celery_worker
+    env_file: .env
+    entrypoint: /app/entrypoint.sh
+    command: celery -A core worker --loglevel=info --concurrency=2
+    volumes:
+      - ./api:/app
+      - ./adapter:/app/adapter
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
+      - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres_db:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      external_bank:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - teamsec_network
+
+  # 7. Celery Beat
+  celery_beat:
+    build: ./api
+    container_name: celery_beat
+    env_file: .env
+    entrypoint: /app/entrypoint.sh
+    command: celery -A core beat --loglevel=info
+    volumes:
+      - ./api:/app
+      - ./adapter:/app/adapter
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
+      - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres_db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - teamsec_network
+
+  # 8. Monitoring - Prometheus
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - adapter_api
+      - external_bank
+      - clickhouse
+    networks:
+      - teamsec_network
+
+  # 9. Monitoring - Grafana
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    networks:
+      - teamsec_network
+
+networks:
+  teamsec_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  grafana_data:
+  prometheus_data:
+  static_files:
