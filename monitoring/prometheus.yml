@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Django Adapter API - django-prometheus exposes /metrics
+  - job_name: 'django-adapter'
+    static_configs:
+      - targets: ['adapter-api:8000']
+    metrics_path: '/metrics'
+
+  # External Bank API (FastAPI) - prometheus-fastapi-instrumentator exposes /metrics
+  - job_name: 'external-bank'
+    static_configs:
+      - targets: ['external-bank-api:8000']
+    metrics_path: '/metrics'
+
+  # ClickHouse - Prometheus handler on port 9363
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse-dw:9363']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
