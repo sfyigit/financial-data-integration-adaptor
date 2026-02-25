@@ -1,0 +1,58 @@
+# =============================================================================
+# TeamSec .gitignore
+# =============================================================================
+
+# --- Environment & Secrets ---
+.env
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Django ---
+*.sqlite3
+db.sqlite3
+staticfiles/
+media/
+
+# --- External Bank Data ---
+external_bank/database/*.sqlite
+external_bank/database/*.sqlite-shm
+external_bank/database/*.sqlite-wal
+
+# --- Node ---
+node_modules/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Docker ---
+*.log
+
+# --- Celery ---
+celerybeat-schedule
+celerybeat-schedule.db
+
+# --- Pytest ---
+.pytest_cache/
+htmlcov/
+.coverage
+
+# --- Grafana ---
+grafana_data/

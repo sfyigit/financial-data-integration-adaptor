@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Register{% endblock %}
+
+{% block content %}
+<div class="min-h-[70vh] flex items-center justify-center">
+    <div class="bg-white p-8 rounded-xl shadow-lg w-full max-w-lg">
+        <div class="text-center mb-8">
+            <h1 class="text-2xl font-bold text-gray-900">Create Account</h1>
+            <p class="text-gray-500 mt-2">Register a new user and tenant</p>
+        </div>
+
+        {% if errors %}
+        <div class="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
+            <div class="flex items-center mb-1">
+                <svg class="w-5 h-5 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <span class="font-semibold">Please fix the following errors:</span>
+            </div>
+            <ul class="list-disc list-inside ml-7 space-y-1">
+                {% for error in errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <form method="post" action="{% url 'register' %}" class="space-y-5">
+            {% csrf_token %}
+
+            <!-- User Information -->
+            <div class="border-b border-gray-200 pb-4 mb-2">
+                <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wider">User Information</h2>
+            </div>
+
+            <div>
+                <label for="username" class="block text-sm font-medium text-gray-700 mb-1">Username</label>
+                <input type="text" id="username" name="username" required
+                       value="{{ username|default:'' }}"
+                       class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                       placeholder="e.g. john_doe">
+            </div>
+
+            <div>
+                <label for="email" class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                <input type="email" id="email" name="email" required
+                       value="{{ email|default:'' }}"
+                       class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                       placeholder="e.g. john@example.com">
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="password" class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                    <input type="password" id="password" name="password" required
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                           placeholder="Min. 8 characters">
+                </div>
+                <div>
+                    <label for="password_confirm" class="block text-sm font-medium text-gray-700 mb-1">Confirm Password</label>
+                    <input type="password" id="password_confirm" name="password_confirm" required
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                           placeholder="Repeat password">
+                </div>
+            </div>
+
+            <!-- Tenant Information -->
+            <div class="border-b border-gray-200 pb-4 mb-2 mt-6">
+                <h2 class="text-sm font-semibold text-gray-500 uppercase tracking-wider">Tenant Information</h2>
+            </div>
+
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="tenant_id" class="block text-sm font-medium text-gray-700 mb-1">Tenant ID</label>
+                    <input type="text" id="tenant_id" name="tenant_id" required
+                           value="{{ tenant_id|default:'' }}"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition uppercase"
+                           placeholder="e.g. BANK004"
+                           pattern="[A-Za-z0-9_]+"
+                           title="Only letters, numbers and underscores allowed">
+                </div>
+                <div>
+                    <label for="tenant_name" class="block text-sm font-medium text-gray-700 mb-1">Tenant Name</label>
+                    <input type="text" id="tenant_name" name="tenant_name" required
+                           value="{{ tenant_name|default:'' }}"
+                           class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition"
+                           placeholder="e.g. Fourth National Bank">
+                </div>
+            </div>
+
+            <div class="bg-amber-50 border border-amber-200 text-amber-700 px-4 py-3 rounded-lg text-sm">
+                <div class="flex items-start">
+                    <svg class="w-5 h-5 mr-2 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    <div>
+                        <p class="font-medium">Important:</p>
+                        <p class="mt-1">A new tenant will be created automatically. To view tenant data on the dashboard, a super admin must associate your account with the tenant.</p>
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit"
+                    class="w-full bg-indigo-600 text-white py-3 px-4 rounded-lg font-medium hover:bg-indigo-700 focus:ring-4 focus:ring-indigo-200 transition">
+                Create Account & Tenant
+            </button>
+        </form>
+
+        <p class="text-center text-gray-500 text-sm mt-6">
+            Already have an account?
+            <a href="{% url 'login' %}" class="text-indigo-600 hover:text-indigo-700 font-medium">Sign In</a>
+        </p>
+    </div>
+</div>
+{% endblock %}

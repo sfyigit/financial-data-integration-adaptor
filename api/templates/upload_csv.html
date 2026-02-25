@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% block title %}Upload CSV{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+    <!-- Page Header -->
+    <div class="mb-8">
+        <h1 class="text-3xl font-bold text-gray-900">Upload CSV Data</h1>
+        <p class="text-gray-500 mt-1">Upload loan or payment data to the External Bank for a registered tenant</p>
+    </div>
+
+    <!-- Success Message -->
+    {% if success and result %}
+    <div class="mb-6 bg-green-50 border border-green-200 rounded-xl p-6">
+        <div class="flex items-center mb-3">
+            <svg class="w-6 h-6 text-green-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <h2 class="text-lg font-semibold text-green-800">Upload Successful!</h2>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+            <div class="bg-white rounded-lg p-3 border border-green-100">
+                <p class="text-xs text-gray-500 uppercase font-medium">Tenant</p>
+                <p class="text-lg font-bold text-gray-900">{{ result.tenant_id }}</p>
+            </div>
+            <div class="bg-white rounded-lg p-3 border border-green-100">
+                <p class="text-xs text-gray-500 uppercase font-medium">File Type</p>
+                <p class="text-lg font-bold text-gray-900">{{ result.file_type }}</p>
+            </div>
+            <div class="bg-white rounded-lg p-3 border border-green-100">
+                <p class="text-xs text-gray-500 uppercase font-medium">Records</p>
+                <p class="text-lg font-bold text-gray-900">{{ result.records_processed }}</p>
+            </div>
+            <div class="bg-white rounded-lg p-3 border border-green-100">
+                <p class="text-xs text-gray-500 uppercase font-medium">Version</p>
+                <p class="text-lg font-bold text-gray-900">v{{ result.version }}</p>
+            </div>
+        </div>
+        <p class="text-sm text-green-700 mt-4">
+            {{ result.message }}
+            You can now trigger a sync from the dashboard to pull this data into the warehouse.
+        </p>
+    </div>
+    {% endif %}
+
+    <!-- Error Messages -->
+    {% if errors %}
+    <div class="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
+        <div class="flex items-center mb-1">
+            <svg class="w-5 h-5 mr-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <span class="font-semibold">Upload failed:</span>
+        </div>
+        <ul class="list-disc list-inside ml-7 space-y-1">
+            {% for error in errors %}
+            <li>{{ error }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    <!-- Upload Form -->
+    <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+        <form method="post" action="{% url 'upload-csv' %}" enctype="multipart/form-data" class="space-y-6">
+            {% csrf_token %}
+
+            <!-- Tenant Selection -->
+            <div>
+                <label for="tenant_id" class="block text-sm font-medium text-gray-700 mb-1">Tenant</label>
+                <select id="tenant_id" name="tenant_id" required
+                        class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition bg-white">
+                    <option value="">-- Select a tenant --</option>
+                    {% for tenant in tenants %}
+                    <option value="{{ tenant.tenant_id }}"
+                            {% if selected_tenant_id == tenant.tenant_id %}selected{% endif %}>
+                        {{ tenant.tenant_id }} - {{ tenant.name }}
+                    </option>
+                    {% empty %}
+                    <option value="" disabled>No tenants available — ask an admin to assign you to a tenant.</option>
+                    {% endfor %}
+                </select>
+                {% if tenants %}
+                <p class="text-xs text-gray-400 mt-1">
+                    Only your assigned tenants are shown. <a href="{% url 'register' %}" class="text-indigo-500 hover:underline">Register a new tenant</a> if needed.
+                </p>
+                {% else %}
+                <div class="mt-3 bg-amber-50 border border-amber-200 text-amber-700 px-4 py-3 rounded-lg text-sm">
+                    <div class="flex items-start">
+                        <svg class="w-5 h-5 mr-2 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+                        </svg>
+                        <div>
+                            <p class="font-medium">No tenants assigned to your account</p>
+                            <p class="mt-1">You need to be assigned to at least one tenant to upload CSV data. Contact a super admin or <a href="{% url 'register' %}" class="text-amber-800 underline font-medium">register a new tenant</a>.</p>
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+            </div>
+
+            <!-- File Type & Loan Type -->
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label for="file_type" class="block text-sm font-medium text-gray-700 mb-1">File Type</label>
+                    <select id="file_type" name="file_type" required
+                            class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition bg-white">
+                        <option value="loans" {% if selected_file_type == "loans" %}selected{% endif %}>Loans</option>
+                        <option value="payments" {% if selected_file_type == "payments" %}selected{% endif %}>Payments</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="loan_type" class="block text-sm font-medium text-gray-700 mb-1">Loan Type</label>
+                    <select id="loan_type" name="loan_type" required
+                            class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition bg-white">
+                        <option value="RETAIL" {% if selected_loan_type == "RETAIL" %}selected{% endif %}>Retail</option>
+                        <option value="COMMERCIAL" {% if selected_loan_type == "COMMERCIAL" %}selected{% endif %}>Commercial</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- CSV File -->
+            <div>
+                <label for="csv_file" class="block text-sm font-medium text-gray-700 mb-1">CSV File</label>
+                <div class="mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-gray-300 border-dashed rounded-lg hover:border-indigo-400 transition"
+                     id="dropzone">
+                    <div class="space-y-1 text-center">
+                        <svg class="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                            <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02"
+                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                        </svg>
+                        <div class="flex text-sm text-gray-600">
+                            <label for="csv_file"
+                                   class="relative cursor-pointer bg-white rounded-md font-medium text-indigo-600 hover:text-indigo-500 focus-within:outline-none">
+                                <span>Upload a CSV file</span>
+                                <input id="csv_file" name="csv_file" type="file" accept=".csv" required class="sr-only"
+                                       onchange="updateFileName(this)">
+                            </label>
+                            <p class="pl-1">or drag and drop</p>
+                        </div>
+                        <p class="text-xs text-gray-500" id="file-name-display">CSV files only (.csv)</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Info Box -->
+            <div class="bg-blue-50 border border-blue-200 text-blue-700 px-4 py-3 rounded-lg text-sm">
+                <div class="flex items-start">
+                    <svg class="w-5 h-5 mr-2 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    <div>
+                        <p class="font-medium">Full Replacement Strategy</p>
+                        <p class="mt-1">Uploading new data will completely replace existing data for the selected tenant/file_type/loan_type combination in the External Bank.</p>
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit"
+                    {% if not tenants %}disabled{% endif %}
+                    class="w-full py-3 px-4 rounded-lg font-medium focus:ring-4 focus:ring-indigo-200 transition flex items-center justify-center {% if tenants %}bg-indigo-600 text-white hover:bg-indigo-700{% else %}bg-gray-300 text-gray-500 cursor-not-allowed{% endif %}">
+                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                </svg>
+                Upload CSV to External Bank
+            </button>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+function updateFileName(input) {
+    const display = document.getElementById('file-name-display');
+    if (input.files && input.files[0]) {
+        const file = input.files[0];
+        const sizeMB = (file.size / 1024 / 1024).toFixed(2);
+        display.textContent = `${file.name} (${sizeMB} MB)`;
+        display.classList.add('text-indigo-600', 'font-medium');
+        display.classList.remove('text-gray-500');
+    } else {
+        display.textContent = 'CSV files only (.csv)';
+        display.classList.remove('text-indigo-600', 'font-medium');
+        display.classList.add('text-gray-500');
+    }
+}
+
+// Drag and drop support
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('csv_file');
+
+['dragenter', 'dragover'].forEach(evt => {
+    dropzone.addEventListener(evt, e => {
+        e.preventDefault();
+        dropzone.classList.add('border-indigo-400', 'bg-indigo-50');
+    });
+});
+
+['dragleave', 'drop'].forEach(evt => {
+    dropzone.addEventListener(evt, e => {
+        e.preventDefault();
+        dropzone.classList.remove('border-indigo-400', 'bg-indigo-50');
+    });
+});
+
+dropzone.addEventListener('drop', e => {
+    const files = e.dataTransfer.files;
+    if (files.length > 0) {
+        fileInput.files = files;
+        updateFileName(fileInput);
+    }
+});
+</script>
+{% endblock %}

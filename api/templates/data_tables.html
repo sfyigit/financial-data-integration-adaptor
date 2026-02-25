@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+{% block title %}Data Explorer{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-8">
+    <div>
+        <h1 class="text-3xl font-bold text-gray-900">Data Explorer</h1>
+        <p class="text-gray-500 mt-1">Browse synchronized loan & payment records from ClickHouse</p>
+    </div>
+</div>
+
+<!-- Filters -->
+<div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-8">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Tenant Select -->
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Tenant</label>
+            <select id="filterTenant" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+                <option value="">Select tenant...</option>
+                {% for tenant in tenants %}
+                <option value="{{ tenant.tenant_id }}">{{ tenant.tenant_id }} — {{ tenant.name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <!-- Table Select -->
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Data Type</label>
+            <select id="filterTable" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+                <option value="loans">Loans</option>
+                <option value="payments">Payments</option>
+            </select>
+        </div>
+
+        <!-- Loan Type Filter -->
+        <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">Loan Type</label>
+            <select id="filterLoanType" class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+                <option value="">All</option>
+                <option value="RETAIL">RETAIL</option>
+                <option value="COMMERCIAL">COMMERCIAL</option>
+            </select>
+        </div>
+
+        <!-- Search Button -->
+        <div class="flex items-end">
+            <button onclick="loadData()" id="searchBtn"
+                    class="w-full bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 transition flex items-center justify-center">
+                <svg class="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+                </svg>
+                Search
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Results Summary -->
+<div id="resultsSummary" class="hidden mb-4">
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between">
+        <p class="text-sm text-gray-600">
+            Showing <span id="showingRange" class="font-medium text-gray-900"></span>
+            of <span id="totalCount" class="font-medium text-gray-900"></span> records
+            for <span id="summaryTenant" class="font-medium text-indigo-600"></span>
+        </p>
+        <div class="flex items-center space-x-2 mt-2 sm:mt-0">
+            <label class="text-sm text-gray-500">Per page:</label>
+            <select id="perPage" onchange="loadData()" class="border border-gray-300 rounded px-2 py-1 text-sm focus:ring-2 focus:ring-indigo-500">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+            </select>
+        </div>
+    </div>
+</div>
+
+<!-- Data Table -->
+<div class="bg-white rounded-xl shadow-sm border border-gray-100 mb-6">
+    <div class="overflow-x-auto">
+        <table class="w-full" id="dataTable">
+            <thead id="dataTableHead">
+                <tr class="bg-gray-50 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    <th class="px-6 py-3" colspan="99">
+                        <span class="text-gray-400">Select a tenant and click Search to browse data</span>
+                    </th>
+                </tr>
+            </thead>
+            <tbody id="dataTableBody">
+                <tr>
+                    <td class="px-6 py-12 text-center text-gray-400" colspan="99">
+                        <svg class="w-12 h-12 mx-auto text-gray-300 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"/>
+                        </svg>
+                        <p class="text-sm">Choose a tenant and data type, then click <strong>Search</strong></p>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Pagination -->
+<div id="pagination" class="hidden flex items-center justify-between mb-8">
+    <button onclick="prevPage()" id="prevBtn"
+            class="px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+        ← Previous
+    </button>
+    <span id="pageInfo" class="text-sm text-gray-500"></span>
+    <button onclick="nextPage()" id="nextBtn"
+            class="px-4 py-2 bg-white border border-gray-300 rounded-lg text-sm text-gray-700 hover:bg-gray-50 transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+        Next →
+    </button>
+</div>
+
+<!-- Loading Overlay -->
+<div id="loadingOverlay" class="hidden fixed inset-0 bg-white bg-opacity-60 z-40 flex items-center justify-center">
+    <div class="bg-white rounded-xl shadow-lg p-6 flex items-center space-x-3">
+        <div class="spinner"></div>
+        <span class="text-gray-600 text-sm">Querying ClickHouse...</span>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+// =============================================================================
+// State
+// =============================================================================
+
+let currentOffset = 0;
+let currentTotal = 0;
+let currentLimit = 50;
+let currentTable = 'loans';
+
+const LOAN_COLUMNS = [
+    { key: 'loan_id', label: 'Loan ID' },
+    { key: 'loan_type', label: 'Type' },
+    { key: 'amount', label: 'Amount', format: 'currency' },
+    { key: 'interest_rate', label: 'Rate', format: 'percent' },
+    { key: 'original_interest_rate', label: 'Orig. Rate' },
+    { key: 'start_date', label: 'Start Date' },
+    { key: 'status', label: 'Status', format: 'status' },
+    { key: 'original_status', label: 'Orig. Status' },
+    { key: 'customer_id', label: 'Customer' },
+    { key: 'customer_segment', label: 'Segment' },
+    { key: 'synced_at', label: 'Synced At' },
+];
+
+const PAYMENT_COLUMNS = [
+    { key: 'payment_id', label: 'Payment ID' },
+    { key: 'loan_id', label: 'Loan ID' },
+    { key: 'loan_type', label: 'Type' },
+    { key: 'payment_amount', label: 'Amount', format: 'currency' },
+    { key: 'payment_date', label: 'Date' },
+    { key: 'original_payment_date', label: 'Orig. Date' },
+    { key: 'installment_status', label: 'Status', format: 'status' },
+    { key: 'principal_component', label: 'Principal', format: 'currency' },
+    { key: 'interest_component', label: 'Interest', format: 'currency' },
+    { key: 'synced_at', label: 'Synced At' },
+];
+
+// =============================================================================
+// Data Loading
+// =============================================================================
+
+async function loadData(offset = 0) {
+    const tenantId = document.getElementById('filterTenant').value;
+    if (!tenantId) {
+        showToast('Please select a tenant first.', 'error');
+        return;
+    }
+
+    currentTable = document.getElementById('filterTable').value;
+    currentLimit = parseInt(document.getElementById('perPage').value);
+    currentOffset = offset;
+    const loanType = document.getElementById('filterLoanType').value;
+
+    // Show loading
+    document.getElementById('loadingOverlay').classList.remove('hidden');
+
+    try {
+        const params = new URLSearchParams({
+            tenant_id: tenantId,
+            table: currentTable,
+            limit: currentLimit,
+            offset: currentOffset,
+        });
+        if (loanType) params.set('loan_type', loanType);
+
+        const response = await fetch(`/api/data-tables/?${params}`);
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        currentTotal = data.total;
+        renderTable(data);
+        updatePagination();
+
+    } catch (e) {
+        showToast(`Error: ${e.message}`, 'error');
+        console.error('Data load error:', e);
+    } finally {
+        document.getElementById('loadingOverlay').classList.add('hidden');
+    }
+}
+
+// =============================================================================
+// Rendering
+// =============================================================================
+
+function renderTable(data) {
+    const columns = currentTable === 'payments' ? PAYMENT_COLUMNS : LOAN_COLUMNS;
+    const thead = document.getElementById('dataTableHead');
+    const tbody = document.getElementById('dataTableBody');
+
+    // Header
+    thead.innerHTML = '<tr class="bg-gray-50 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">' +
+        columns.map(c => `<th class="px-4 py-3 whitespace-nowrap">${c.label}</th>`).join('') +
+        '</tr>';
+
+    // Body
+    if (data.records.length === 0) {
+        tbody.innerHTML = `<tr><td class="px-6 py-12 text-center text-gray-400" colspan="${columns.length}">
+            No records found for this tenant/filter combination.</td></tr>`;
+    } else {
+        tbody.innerHTML = data.records.map(rec =>
+            '<tr class="hover:bg-gray-50 transition border-b border-gray-50">' +
+            columns.map(c => `<td class="px-4 py-3 text-sm ${c.format === 'currency' ? 'text-right' : ''} whitespace-nowrap">${formatCell(rec[c.key], c.format)}</td>`).join('') +
+            '</tr>'
+        ).join('');
+    }
+
+    // Summary
+    const summary = document.getElementById('resultsSummary');
+    summary.classList.remove('hidden');
+    const from = data.records.length > 0 ? currentOffset + 1 : 0;
+    const to = currentOffset + data.records.length;
+    document.getElementById('showingRange').textContent = `${from}–${to}`;
+    document.getElementById('totalCount').textContent = currentTotal.toLocaleString();
+    document.getElementById('summaryTenant').textContent = data.tenant_id;
+}
+
+function formatCell(value, format) {
+    if (value == null || value === '') return '<span class="text-gray-300">—</span>';
+
+    switch (format) {
+        case 'currency':
+            return typeof value === 'number'
+                ? '$' + value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                : value;
+        case 'percent':
+            return typeof value === 'number'
+                ? (value * 100).toFixed(2) + '%'
+                : value;
+        case 'status':
+            const colors = {
+                ACTIVE: 'bg-green-100 text-green-800', PAID: 'bg-indigo-100 text-indigo-800',
+                CLOSED: 'bg-gray-100 text-gray-800', DEFAULT: 'bg-red-100 text-red-800',
+                RESTRUCTURED: 'bg-amber-100 text-amber-800', UNKNOWN: 'bg-gray-100 text-gray-500',
+                SCHEDULED: 'bg-blue-100 text-blue-800', CANCELLED: 'bg-orange-100 text-orange-800',
+                PENDING: 'bg-purple-100 text-purple-800',
+            };
+            const cls = colors[value] || 'bg-gray-100 text-gray-700';
+            return `<span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${cls}">${value}</span>`;
+        default:
+            return String(value);
+    }
+}
+
+// =============================================================================
+// Pagination
+// =============================================================================
+
+function updatePagination() {
+    const pag = document.getElementById('pagination');
+    pag.classList.remove('hidden');
+
+    const totalPages = Math.ceil(currentTotal / currentLimit);
+    const currentPage = Math.floor(currentOffset / currentLimit) + 1;
+
+    document.getElementById('prevBtn').disabled = currentOffset <= 0;
+    document.getElementById('nextBtn').disabled = (currentOffset + currentLimit) >= currentTotal;
+    document.getElementById('pageInfo').textContent = `Page ${currentPage} of ${totalPages}`;
+}
+
+function prevPage() {
+    const newOffset = Math.max(0, currentOffset - currentLimit);
+    loadData(newOffset);
+}
+
+function nextPage() {
+    const newOffset = currentOffset + currentLimit;
+    if (newOffset < currentTotal) loadData(newOffset);
+}
+
+// =============================================================================
+// Toast
+// =============================================================================
+
+function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    const colors = { success: 'bg-green-600', error: 'bg-red-600', info: 'bg-indigo-600' };
+    toast.className = `fixed bottom-6 right-6 ${colors[type] || colors.info} text-white px-6 py-3 rounded-xl shadow-lg text-sm font-medium z-50 fade-in`;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+    setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.5s'; }, 3000);
+    setTimeout(() => toast.remove(), 3500);
+}
+
+// =============================================================================
+// Keyboard shortcut: Enter to search
+// =============================================================================
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.target.closest('button')) loadData();
+});
+</script>
+{% endblock %}
