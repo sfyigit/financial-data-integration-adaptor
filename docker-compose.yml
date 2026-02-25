@@ -16,7 +16,7 @@ services:
       retries: 3
       start_period: 10s
     networks:
-      teamsec_network:
+      fsec_network:
         aliases:
           - external-bank-api
 
@@ -25,22 +25,22 @@ services:
     image: postgres:15
     container_name: postgres_db
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-teamsec_db}
-      POSTGRES_USER: ${POSTGRES_USER:-teamsec_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-teamsec_pg_pass_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-fsec_db}
+      POSTGRES_USER: ${POSTGRES_USER:-fsec_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fsec_pg_pass_2026}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U teamsec_user -d teamsec_db"]
+      test: ["CMD-SHELL", "pg_isready -U fsec_user -d fsec_db"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - teamsec_network
+      - fsec_network
 
   # 3. Message Broker (Redis)
   redis:
@@ -56,7 +56,7 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - teamsec_network
+      - fsec_network
 
   # 4. Data Warehouse (ClickHouse)
   clickhouse:
@@ -81,7 +81,7 @@ services:
       retries: 5
       start_period: 15s
     networks:
-      teamsec_network:
+      fsec_network:
         aliases:
           - clickhouse-dw
 
@@ -97,7 +97,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - DATABASE_URL=${DATABASE_URL:-postgres://fsec_user:fsec_pg_pass_2026@postgres_db:5432/fsec_db}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
@@ -113,7 +113,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      teamsec_network:
+      fsec_network:
         aliases:
           - adapter-api
 
@@ -128,7 +128,7 @@ services:
       - ./api:/app
       - ./adapter:/app/adapter
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - DATABASE_URL=${DATABASE_URL:-postgres://fsec_user:fsec_pg_pass_2026@postgres_db:5432/fsec_db}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
@@ -144,7 +144,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - teamsec_network
+      - fsec_network
 
   # 7. Celery Beat
   celery_beat:
@@ -157,7 +157,7 @@ services:
       - ./api:/app
       - ./adapter:/app/adapter
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgres://teamsec_user:teamsec_pg_pass_2026@postgres_db:5432/teamsec_db}
+      - DATABASE_URL=${DATABASE_URL:-postgres://fsec_user:fsec_pg_pass_2026@postgres_db:5432/fsec_db}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
@@ -169,7 +169,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - teamsec_network
+      - fsec_network
 
   # 8. Monitoring - Prometheus
   prometheus:
@@ -186,7 +186,7 @@ services:
       - external_bank
       - clickhouse
     networks:
-      - teamsec_network
+      - fsec_network
 
   # 9. Monitoring - Grafana
   grafana:
@@ -206,10 +206,10 @@ services:
     depends_on:
       - prometheus
     networks:
-      - teamsec_network
+      - fsec_network
 
 networks:
-  teamsec_network:
+  fsec_network:
     driver: bridge
 
 volumes:
