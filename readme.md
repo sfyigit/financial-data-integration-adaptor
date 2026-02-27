@@ -32,7 +32,7 @@ Multi-tenant SaaS platform that integrates with external banking systems, valida
 ├── monitoring/           # Prometheus & Grafana configs
 ├── docker-compose.yml    # Dev orchestration (9 services)
 ├── docker-compose.prod.yml  # Production overrides
-└── Architecture.md       # Detailed architecture doc (TR)
+└── Architecture.md       # Detailed architecture doc
 ```
 
 ## Quick Start

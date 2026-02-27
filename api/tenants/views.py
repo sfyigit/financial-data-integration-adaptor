@@ -359,21 +359,45 @@ def upload_csv_page(request):
             external_bank_url = settings.EXTERNAL_BANK_URL
             upload_url = f"{external_bank_url}/upload"
 
-            # Read file content and send to external bank
-            file_content = csv_file.read()
+            # Dynamic timeout & streaming for large files (200MB+)
+            LARGE_FILE_THRESHOLD = 200 * 1024 * 1024  # 200MB
+            file_size = csv_file.size
 
-            response = http_requests.post(
-                upload_url,
-                params={
-                    "tenant_id": tenant_id,
-                    "file_type": file_type,
-                    "loan_type": loan_type,
-                },
-                files={
-                    "file": (csv_file.name, file_content, "text/csv"),
-                },
-                timeout=60,
-            )
+            if file_size > LARGE_FILE_THRESHOLD:
+                # Large file: stream directly, longer timeout (~1s per MB, min 300s)
+                upload_timeout = max(300, int(file_size / (1024 * 1024)))
+                csv_file.seek(0)
+                logger.info(
+                    f"Large file upload ({file_size / (1024*1024):.1f} MB) "
+                    f"for {tenant_id}/{file_type}/{loan_type} - streaming with {upload_timeout}s timeout"
+                )
+                response = http_requests.post(
+                    upload_url,
+                    params={
+                        "tenant_id": tenant_id,
+                        "file_type": file_type,
+                        "loan_type": loan_type,
+                    },
+                    files={
+                        "file": (csv_file.name, csv_file, "text/csv"),
+                    },
+                    timeout=upload_timeout,
+                )
+            else:
+                # Normal file: read into memory
+                file_content = csv_file.read()
+                response = http_requests.post(
+                    upload_url,
+                    params={
+                        "tenant_id": tenant_id,
+                        "file_type": file_type,
+                        "loan_type": loan_type,
+                    },
+                    files={
+                        "file": (csv_file.name, file_content, "text/csv"),
+                    },
+                    timeout=60,
+                )
 
             if response.status_code == 200:
                 result = response.json()
@@ -548,18 +572,41 @@ def api_upload_csv(request):
     # --- Forward to External Bank ---
     try:
         external_bank_url = settings.EXTERNAL_BANK_URL
-        file_content = csv_file.read()
 
-        response = http_requests.post(
-            f"{external_bank_url}/upload",
-            params={
-                "tenant_id": tenant_id,
-                "file_type": file_type,
-                "loan_type": loan_type,
-            },
-            files={"file": (csv_file.name, file_content, "text/csv")},
-            timeout=60,
-        )
+        # Dynamic timeout & streaming for large files (200MB+)
+        LARGE_FILE_THRESHOLD = 200 * 1024 * 1024  # 200MB
+        file_size = csv_file.size
+
+        if file_size > LARGE_FILE_THRESHOLD:
+            # Large file: stream directly, longer timeout (~1s per MB, min 300s)
+            upload_timeout = max(300, int(file_size / (1024 * 1024)))
+            csv_file.seek(0)
+            logger.info(
+                f"Large file API upload ({file_size / (1024*1024):.1f} MB) "
+                f"for {tenant_id}/{file_type}/{loan_type} - streaming with {upload_timeout}s timeout"
+            )
+            response = http_requests.post(
+                f"{external_bank_url}/upload",
+                params={
+                    "tenant_id": tenant_id,
+                    "file_type": file_type,
+                    "loan_type": loan_type,
+                },
+                files={"file": (csv_file.name, csv_file, "text/csv")},
+                timeout=upload_timeout,
+            )
+        else:
+            file_content = csv_file.read()
+            response = http_requests.post(
+                f"{external_bank_url}/upload",
+                params={
+                    "tenant_id": tenant_id,
+                    "file_type": file_type,
+                    "loan_type": loan_type,
+                },
+                files={"file": (csv_file.name, file_content, "text/csv")},
+                timeout=60,
+            )
 
         if response.status_code == 200:
             return Response(response.json(), status=status.HTTP_200_OK)

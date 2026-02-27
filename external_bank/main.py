@@ -57,11 +57,16 @@ app.add_middleware(
 )
 
 # --- Prometheus Metrics ---
+# Custom bucket resolution: default (0.1, 0.5, 1.0) is too coarse for upload operations
+# that can take seconds to minutes. We add fine-grained buckets for per-handler latency.
 Instrumentator(
     should_group_status_codes=True,
     should_ignore_untemplated=True,
     excluded_handlers=["/metrics"],
-).instrument(app).expose(app, endpoint="/metrics")
+).instrument(
+    app,
+    latency_lowr_buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0, 60.0, 120.0),
+).expose(app, endpoint="/metrics")
 
 
 # --- Helper Functions ---
@@ -183,13 +188,32 @@ async def upload_csv(
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
-    # -- Read CSV --
+    # -- Read CSV (chunked for large files) --
+    CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
     try:
-        raw_content = await file.read()
-        content = raw_content.decode("utf-8")
-    except UnicodeDecodeError:
-        # Fallback to latin-1 encoding
-        content = raw_content.decode("latin-1")
+        raw_chunks = []
+        total_size = 0
+        while True:
+            chunk = await file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            raw_chunks.append(chunk)
+            total_size += len(chunk)
+        raw_content = b"".join(raw_chunks)
+
+        if total_size > 200 * 1024 * 1024:
+            logger.info(
+                f"[{tenant_id}] Large file received: {total_size / (1024*1024):.1f} MB "
+                f"({file_type}/{loan_type})"
+            )
+
+        try:
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw_content.decode("latin-1")
+    except Exception as e:
+        logger.error(f"[{tenant_id}] File read error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {str(e)}")
 
     records = parse_csv_content(content)
 
