@@ -13,6 +13,7 @@ from typing import Optional
 
 class LoanRecord(BaseModel):
     """Single loan record — covers both retail and commercial credits."""
+    id: Optional[int] = None  # DB primary key (used for cursor-based pagination)
     # Core identifiers
     loan_account_number: str
     loan_type: str
@@ -79,6 +80,7 @@ class LoanRecord(BaseModel):
 
 class PaymentRecord(BaseModel):
     """Single payment / installment record."""
+    id: Optional[int] = None  # DB primary key (used for cursor-based pagination)
     payment_id: str
     loan_account_number: str
     loan_type: str

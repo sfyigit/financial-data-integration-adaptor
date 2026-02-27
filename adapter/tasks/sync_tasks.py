@@ -21,8 +21,11 @@ def check_for_updates():
 
     For each tenant, it compares the remote version with the locally stored version.
     If a newer version is detected, it triggers a sync task.
+
+    Skips tenants that already have a running sync to prevent duplicate tasks
+    from consuming excessive memory.
     """
-    from tenants.models import Tenant
+    from tenants.models import Tenant, SyncLog
     logger.info("=== Starting periodic update check ===")
 
     active_tenants = Tenant.objects.filter(is_active=True)
@@ -32,9 +35,23 @@ def check_for_updates():
         return {"status": "no_tenants"}
 
     triggered_count = 0
+    skipped_count = 0
 
     for tenant in active_tenants:
         try:
+            # ── Guard: skip if a sync is already running for this tenant ──
+            running_syncs = SyncLog.objects.filter(
+                tenant=tenant,
+                status="running",
+            ).count()
+            if running_syncs > 0:
+                logger.info(
+                    f"[{tenant.tenant_id}] Skipping — {running_syncs} sync(s) "
+                    f"already running"
+                )
+                skipped_count += 1
+                continue
+
             has_updates = _check_tenant_updates(tenant)
             if has_updates:
                 # Trigger async sync
@@ -46,15 +63,22 @@ def check_for_updates():
         except Exception as e:
             logger.error(f"[{tenant.tenant_id}] Update check failed: {e}")
 
-    logger.info(f"=== Update check completed: {triggered_count} syncs triggered ===")
-    return {"status": "completed", "syncs_triggered": triggered_count}
+    logger.info(
+        f"=== Update check completed: {triggered_count} syncs triggered, "
+        f"{skipped_count} skipped (already running) ==="
+    )
+    return {
+        "status": "completed",
+        "syncs_triggered": triggered_count,
+        "skipped": skipped_count,
+    }
 
 
 @shared_task(
     name="adapter.tasks.sync_tasks.run_sync_for_tenant",
     bind=True,
-    max_retries=3,
-    default_retry_delay=60,
+    max_retries=2,
+    default_retry_delay=30,
 )
 def run_sync_for_tenant(self, tenant_id: str, file_type: str = None, loan_type: str = None):
     """
@@ -63,10 +87,12 @@ def run_sync_for_tenant(self, tenant_id: str, file_type: str = None, loan_type: 
     This task:
     1. Fetches data from the External Bank API.
     2. Validates the data (field-level + cross-file integrity).
-    3. Normalizes valid records.
+    3. Normalizes valid records (in memory-efficient batches).
     4. Loads into ClickHouse staging tables.
     5. Performs atomic swap if all validations pass.
     6. Computes data profiling statistics.
+
+    Includes a distributed lock: only one sync per tenant at a time.
 
     Args:
         tenant_id: Tenant identifier (e.g., BANK001).
@@ -74,8 +100,31 @@ def run_sync_for_tenant(self, tenant_id: str, file_type: str = None, loan_type: 
         loan_type: Optional specific loan type to sync (RETAIL/COMMERCIAL).
     """
     from adapter.sync_service import SyncService
+    from tenants.models import SyncLog
 
-    logger.info(f"[{tenant_id}] Starting sync task (file_type={file_type}, loan_type={loan_type})")
+    logger.info(
+        f"[{tenant_id}] Starting sync task "
+        f"(file_type={file_type}, loan_type={loan_type}, "
+        f"attempt={self.request.retries + 1}/{self.max_retries + 1})"
+    )
+
+    # ── Guard: prevent concurrent syncs for the same tenant ──
+    # Only check on first attempt (retries should be allowed)
+    if self.request.retries == 0:
+        running_count = SyncLog.objects.filter(
+            tenant__tenant_id=tenant_id,
+            status="running",
+        ).count()
+        if running_count > 0:
+            logger.warning(
+                f"[{tenant_id}] Another sync is already running "
+                f"({running_count} active). Skipping this task."
+            )
+            return {
+                "status": "skipped",
+                "tenant_id": tenant_id,
+                "reason": "concurrent_sync_running",
+            }
 
     try:
         service = SyncService()
@@ -88,9 +137,40 @@ def run_sync_for_tenant(self, tenant_id: str, file_type: str = None, loan_type: 
         return result
 
     except Exception as e:
-        logger.error(f"[{tenant_id}] Sync task failed: {e}")
+        logger.error(f"[{tenant_id}] Sync task failed (attempt {self.request.retries + 1}): {e}")
+
+        # If we've exhausted all retries, mark any stuck sync_logs as failed
+        if self.request.retries >= self.max_retries:
+            logger.error(f"[{tenant_id}] All retries exhausted. Marking stuck sync logs as failed.")
+            _mark_stuck_synclogs_failed(tenant_id, str(e))
+            return {
+                "status": "failed",
+                "tenant_id": tenant_id,
+                "error": str(e),
+                "retries_exhausted": True,
+            }
+
         # Retry on transient failures
         raise self.retry(exc=e)
+
+
+def _mark_stuck_synclogs_failed(tenant_id: str, error_message: str):
+    """Mark all 'running' sync logs for a tenant as 'failed' — cleanup for stuck tasks."""
+    try:
+        from tenants.models import SyncLog
+        stuck_logs = SyncLog.objects.filter(
+            tenant__tenant_id=tenant_id,
+            status="running",
+        )
+        count = stuck_logs.update(
+            status="failed",
+            error_message=f"Task failed after max retries: {error_message}",
+            completed_at=timezone.now(),
+        )
+        if count:
+            logger.info(f"[{tenant_id}] Marked {count} stuck sync logs as failed")
+    except Exception as cleanup_err:
+        logger.error(f"[{tenant_id}] Failed to cleanup stuck sync logs: {cleanup_err}")
 
 
 def _check_tenant_updates(tenant) -> bool:

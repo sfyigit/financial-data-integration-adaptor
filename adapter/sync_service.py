@@ -31,7 +31,16 @@ from adapter.warehouse.clickhouse_client import ClickHouseClient
 logger = logging.getLogger("adapter.sync_service")
 
 # Maximum number of records to fetch per API call (for chunked processing)
-CHUNK_SIZE = 10_000
+# 50K provides good balance: ~62 calls for 3M records vs 310 calls with 10K
+CHUNK_SIZE = 50_000
+
+# Timeout per chunk fetch (seconds) — large datasets can be slow
+FETCH_TIMEOUT = 120
+
+# Batch size for normalize + ClickHouse load (limits peak memory)
+# With 100K: peak memory ≈ 3M raw records + 100K normalized ≈ 1.5GB
+# Without batching: peak ≈ 3M raw + 3M normalized + 3M CH rows ≈ 4.5GB
+NORMALIZE_BATCH_SIZE = 100_000
 
 
 class SyncService:
@@ -199,6 +208,7 @@ class SyncService:
                     for err in cross_result.errors:
                         validation_result.add_error(err)
                     validation_result.invalid_count += cross_result.invalid_count
+            del loan_records  # Free memory — no longer needed
 
         # =====================================================================
         # Step 3: Handle validation failures (All-or-Nothing)
@@ -238,32 +248,52 @@ class SyncService:
             }
 
         # =====================================================================
-        # Step 4: Normalize records
+        # Steps 4+5: Normalize records in batches + Load into ClickHouse
         # =====================================================================
-        if file_type == "loans":
-            normalized = [Normalizer.normalize_loan_record(r) for r in records]
-        else:
-            normalized = [Normalizer.normalize_payment_record(r) for r in records]
-
-        logger.info(f"[{tenant_id}] Normalized {len(normalized)} {file_type} records")
-
-        # =====================================================================
-        # Step 5: Load into ClickHouse staging table
-        # =====================================================================
+        # Process in NORMALIZE_BATCH_SIZE chunks to avoid peak memory explosion.
+        # Without batching: 3M raw + 3M normalized + 3M CH rows ≈ 4.5GB
+        # With batching:    3M raw + 100K normalized at a time  ≈ 1.5GB
         table_name = file_type  # 'loans' or 'payments'
+        total_normalized = 0
 
         try:
             self.ch_client.create_staging_table(table_name)
 
-            if file_type == "loans":
-                self.ch_client.load_loans_to_staging(tenant_id, normalized)
-            else:
-                self.ch_client.load_payments_to_staging(tenant_id, normalized)
+            for batch_start in range(0, len(records), NORMALIZE_BATCH_SIZE):
+                batch_end = min(batch_start + NORMALIZE_BATCH_SIZE, len(records))
+                batch = records[batch_start:batch_end]
+                batch_num = batch_start // NORMALIZE_BATCH_SIZE + 1
+
+                # Normalize this batch
+                if file_type == "loans":
+                    normalized_batch = [Normalizer.normalize_loan_record(r) for r in batch]
+                else:
+                    normalized_batch = [Normalizer.normalize_payment_record(r) for r in batch]
+
+                # Load batch into staging
+                if file_type == "loans":
+                    self.ch_client.load_loans_to_staging(tenant_id, normalized_batch)
+                else:
+                    self.ch_client.load_payments_to_staging(tenant_id, normalized_batch)
+
+                total_normalized += len(normalized_batch)
+                del normalized_batch  # Free memory immediately
+
+                logger.info(
+                    f"[{tenant_id}] Normalize+Load batch {batch_num}: "
+                    f"{len(batch)} records ({total_normalized}/{len(records)} total)"
+                )
 
         except Exception as e:
             # Clean up staging on failure
             self.ch_client.drop_staging_table(table_name)
             raise RuntimeError(f"Failed to load data into staging: {e}")
+
+        logger.info(f"[{tenant_id}] Normalized+loaded {total_normalized} {file_type} records")
+
+        # Free raw records — no longer needed after normalize+load
+        num_records = len(records)
+        del records
 
         # =====================================================================
         # Step 6: Atomic swap (staging -> production)
@@ -297,14 +327,14 @@ class SyncService:
 
         logger.info(
             f"[{tenant_id}] Sync completed for {file_type}/{loan_type}: "
-            f"{len(normalized)} records, v{remote_version}"
+            f"{total_normalized} records, v{remote_version}"
         )
 
         return {
             "file_type": file_type,
             "loan_type": loan_type,
             "status": "success",
-            "records_synced": len(normalized),
+            "records_synced": total_normalized,
             "version": remote_version,
         }
 
@@ -374,7 +404,8 @@ class SyncService:
     ) -> list[dict]:
         """
         Fetch data from the External Bank API.
-        Uses pagination/chunking for large datasets to avoid memory overflow.
+        Uses cursor-based pagination (after_id) for efficient fetching of large datasets.
+        Falls back to offset-based pagination if the API doesn't return 'id' fields.
 
         Args:
             tenant_id: Tenant identifier.
@@ -385,43 +416,66 @@ class SyncService:
             List of record dictionaries.
         """
         all_records = []
-        offset = 0
+        after_id = 0  # Start from beginning (id > 0 = all records)
+        chunk_num = 0
 
         while True:
+            chunk_num += 1
+            # Use cursor-based pagination (WHERE id > after_id ORDER BY id)
+            # This is O(1) per page via primary key index, unlike OFFSET which is O(n)
             url = (
                 f"{self.external_bank_url}/data"
                 f"?tenant_id={tenant_id}"
                 f"&file_type={file_type}"
                 f"&loan_type={loan_type}"
                 f"&limit={CHUNK_SIZE}"
-                f"&offset={offset}"
+                f"&after_id={after_id}"
             )
 
             try:
-                response = requests.get(url, timeout=30)
+                response = requests.get(url, timeout=FETCH_TIMEOUT)
                 response.raise_for_status()
                 data = response.json()
             except requests.RequestException as e:
-                logger.error(f"[{tenant_id}] Failed to fetch data chunk: {e}")
-                raise RuntimeError(f"Data fetch failed: {e}")
+                logger.error(
+                    f"[{tenant_id}] Failed to fetch data chunk {chunk_num} "
+                    f"(after_id={after_id}): {e}"
+                )
+                raise RuntimeError(f"Data fetch failed at chunk {chunk_num}: {e}")
 
             records = data.get("data", [])
             total = data.get("total_records", 0)
 
+            if not records:
+                break
+
             all_records.extend(records)
 
-            logger.debug(
-                f"[{tenant_id}] Fetched {len(records)} records "
-                f"(offset={offset}, total={total})"
+            # Get the last record's id for cursor-based pagination
+            last_record = records[-1]
+            last_id = last_record.get("id")
+
+            if last_id is not None:
+                after_id = last_id
+            else:
+                # Fallback: if no 'id' field, stop after first chunk
+                logger.warning(
+                    f"[{tenant_id}] No 'id' field in response — "
+                    f"cursor pagination not supported, fetched {len(all_records)} records"
+                )
+                break
+
+            logger.info(
+                f"[{tenant_id}] Chunk {chunk_num}: fetched {len(records)} records "
+                f"(total so far: {len(all_records)}/{total}, last_id={after_id})"
             )
 
             # Check if we have all records
-            if len(all_records) >= total or not records:
+            if len(all_records) >= total:
                 break
 
-            offset += CHUNK_SIZE
-
         logger.info(
-            f"[{tenant_id}] Fetched total {len(all_records)} {file_type}/{loan_type} records"
+            f"[{tenant_id}] Fetched total {len(all_records)} {file_type}/{loan_type} records "
+            f"in {chunk_num} chunks"
         )
         return all_records

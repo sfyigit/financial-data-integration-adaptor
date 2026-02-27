@@ -364,8 +364,8 @@ def upload_csv_page(request):
             file_size = csv_file.size
 
             if file_size > LARGE_FILE_THRESHOLD:
-                # Large file: stream directly, longer timeout (~1s per MB, min 300s)
-                upload_timeout = max(300, int(file_size / (1024 * 1024)))
+                # Large file: stream directly, generous timeout (~5s per MB for DB processing, min 600s)
+                upload_timeout = max(600, int(file_size / (1024 * 1024)) * 5)
                 csv_file.seek(0)
                 logger.info(
                     f"Large file upload ({file_size / (1024*1024):.1f} MB) "
@@ -578,8 +578,8 @@ def api_upload_csv(request):
         file_size = csv_file.size
 
         if file_size > LARGE_FILE_THRESHOLD:
-            # Large file: stream directly, longer timeout (~1s per MB, min 300s)
-            upload_timeout = max(300, int(file_size / (1024 * 1024)))
+            # Large file: stream directly, generous timeout (~5s per MB for DB processing, min 600s)
+            upload_timeout = max(600, int(file_size / (1024 * 1024)) * 5)
             csv_file.seek(0)
             logger.info(
                 f"Large file API upload ({file_size / (1024*1024):.1f} MB) "
