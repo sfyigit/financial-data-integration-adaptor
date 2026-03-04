@@ -2,15 +2,18 @@
 External Bank Simulation API
 =============================
 FastAPI service simulating an external banking system.
-Uses isolated SQLite databases per tenant (bank).
+Uses PostgreSQL (multi-tenant) + MinIO (S3 object storage).
 
-Supports CSV files with `;` (semicolon) or `,` (comma) delimiters.
-Automatically maps mock-data column names to the internal schema.
+Architecture:
+    - CSV uploads are stored in MinIO for durable, streaming access.
+    - Parsed records are stored in PostgreSQL for querying.
+    - Sync service downloads CSVs from MinIO via presigned URLs.
 
 Endpoints:
-    POST /upload          - Upload a CSV file (loans/payments)
-    GET  /data            - Return stored data as JSON
+    POST /upload          - Upload a CSV file (loans/payments) → MinIO + PostgreSQL
+    GET  /data            - Return stored data as JSON (with cursor pagination)
     GET  /version         - Data version info (for sync checks)
+    GET  /files/download  - Get presigned MinIO URL for a specific version
     GET  /tenants         - List available tenants
     GET  /health          - Health check
 """
@@ -29,13 +32,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from sqlalchemy import text
-from models import Loan, Payment, DataVersion
+from models import Loan, Payment, DataVersion, FileUpload
 from schemas import (
     UploadResponse, DataResponse, VersionResponse,
     TenantListResponse, HealthResponse, ErrorResponse,
     LoanRecord, PaymentRecord, DataVersionInfo,
+    FileDownloadResponse,
 )
-from db import get_session, init_tenant_db, list_tenants, DATABASE_DIR
+from db import get_session, init_db, list_tenants
+import minio_client as mc
 
 # --- Logging ---
 logging.basicConfig(
@@ -47,8 +52,12 @@ logger = logging.getLogger("external_bank")
 # --- FastAPI Application ---
 app = FastAPI(
     title="External Bank Simulation API",
-    description="API simulating an external banking system. Accepts credit/payment data via CSV.",
-    version="2.0.0",
+    description=(
+        "API simulating an external banking system. "
+        "Accepts credit/payment data via CSV. "
+        "Stores files in MinIO, records in PostgreSQL."
+    ),
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -60,8 +69,6 @@ app.add_middleware(
 )
 
 # --- Prometheus Metrics ---
-# Custom bucket resolution: default (0.1, 0.5, 1.0) is too coarse for upload operations
-# that can take seconds to minutes. We add fine-grained buckets for per-handler latency.
 Instrumentator(
     should_group_status_codes=True,
     should_ignore_untemplated=True,
@@ -73,41 +80,6 @@ Instrumentator(
 
 
 # --- Helper Functions ---
-
-def compute_checksum(records: list[dict]) -> str:
-    """Computes SHA-256 checksum for data integrity verification."""
-    raw = str(sorted([str(sorted(r.items())) for r in records]))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _detect_delimiter(content: str) -> str:
-    """Auto-detect CSV delimiter by inspecting the header line."""
-    first_line = content.split("\n", 1)[0]
-    if ";" in first_line:
-        return ";"
-    return ","
-
-
-def parse_csv_content(content: str) -> list[dict]:
-    """
-    Parses CSV content into a list of dictionaries.
-    Auto-detects delimiter (`;` or `,`).
-    """
-    delimiter = _detect_delimiter(content)
-    reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
-    records = []
-    for row in reader:
-        # Skip empty rows
-        if any(v and v.strip() for v in row.values()):
-            # Lowercase all keys and strip whitespace
-            cleaned = {
-                k.strip().lower(): (v.strip() if v else "")
-                for k, v in row.items()
-                if k is not None
-            }
-            records.append(cleaned)
-    return records
-
 
 def _safe_float(value, default=0.0):
     """Safely convert a value to float, returning default on failure."""
@@ -129,11 +101,19 @@ def _safe_int(value, default=None):
         return default
 
 
-def update_version(session, file_type: str, loan_type: str, record_count: int, checksum: str) -> int:
+def update_version(
+    session,
+    tenant_id: str,
+    file_type: str,
+    loan_type: str,
+    record_count: int,
+    checksum: str,
+    minio_object_key: str = None,
+) -> int:
     """Updates or creates a DataVersion entry. Returns the new version number."""
     version_entry = (
         session.query(DataVersion)
-        .filter_by(file_type=file_type, loan_type=loan_type)
+        .filter_by(tenant_id=tenant_id, file_type=file_type, loan_type=loan_type)
         .first()
     )
 
@@ -142,15 +122,18 @@ def update_version(session, file_type: str, loan_type: str, record_count: int, c
         version_entry.record_count = record_count
         version_entry.last_updated = datetime.utcnow()
         version_entry.checksum = checksum
+        version_entry.minio_object_key = minio_object_key
         new_version = version_entry.version
     else:
         version_entry = DataVersion(
+            tenant_id=tenant_id,
             file_type=file_type,
             loan_type=loan_type,
             version=1,
             record_count=record_count,
             last_updated=datetime.utcnow(),
             checksum=checksum,
+            minio_object_key=minio_object_key,
         )
         session.add(version_entry)
         new_version = 1
@@ -170,13 +153,13 @@ async def upload_csv(
     """
     Upload a CSV file to store bank data.
 
-    - **tenant_id**: Bank identifier (each bank has its own isolated SQLite database)
-    - **file_type**: 'loans' (credit records) or 'payments' (payment records)
-    - **loan_type**: 'RETAIL' or 'COMMERCIAL'
-    - **file**: The CSV file to upload (supports `;` or `,` delimiters)
+    Flow:
+    1. Stream upload to temp file on disk.
+    2. Upload the temp file to MinIO (S3).
+    3. Parse CSV and bulk-insert into PostgreSQL.
+    4. Update version metadata.
 
-    Performs full replacement of existing data for the given loan_type.
-    Uses temp-file + streaming for memory-efficient processing of large files.
+    Performs full replacement of existing data for the given tenant_id/loan_type.
     """
     # -- Validation --
     tenant_id = tenant_id.strip().upper()
@@ -192,7 +175,7 @@ async def upload_csv(
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
-    # -- Stream upload to temp file (avoids holding entire CSV in memory) --
+    # -- Stream upload to temp file --
     CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
     tmp_path = None
     try:
@@ -207,26 +190,24 @@ async def upload_csv(
                 total_size += len(chunk)
 
         size_mb = total_size / (1024 * 1024)
-        if total_size > 200 * 1024 * 1024:
-            logger.info(
-                f"[{tenant_id}] Large file received: {size_mb:.1f} MB "
-                f"({file_type}/{loan_type}) - saved to temp file"
-            )
-
+        logger.info(
+            f"[{tenant_id}] File received: {size_mb:.1f} MB "
+            f"({file_type}/{loan_type}) - saved to temp file"
+        )
     except Exception as e:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         logger.error(f"[{tenant_id}] File read error: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {str(e)}")
 
-    # -- Detect delimiter and stream-process CSV from temp file --
+    # -- Process: MinIO upload + PostgreSQL insert --
     try:
         # Detect delimiter from first line
         with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
             first_line = f.readline()
         delimiter = ";" if ";" in first_line else ","
 
-        # Count total records for logging (header-aware)
+        # Count total records
         with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
             total_lines = sum(1 for _ in f) - 1  # subtract header
 
@@ -235,22 +216,36 @@ async def upload_csv(
 
         logger.info(f"[{tenant_id}] {file_type}/{loan_type} upload started - {total_lines} records")
 
-        # -- Write to Database (stream from file, batch inserts) --
-        session = get_session(tenant_id)
+        # -- Step 1: Upload CSV to MinIO --
+        # Get the next version number (peek)
+        session = get_session()
+        try:
+            version_entry = (
+                session.query(DataVersion)
+                .filter_by(tenant_id=tenant_id, file_type=file_type, loan_type=loan_type)
+                .first()
+            )
+            next_version = (version_entry.version + 1) if version_entry else 1
+        finally:
+            session.close()
+
+        object_key = mc.build_object_key(
+            tenant_id, file_type, loan_type, next_version, file.filename,
+        )
+        minio_result = mc.upload_file(object_key, tmp_path)
+        logger.info(f"[{tenant_id}] CSV uploaded to MinIO: {object_key}")
+
+        # -- Step 2: Bulk insert into PostgreSQL --
+        session = get_session()
         try:
             BATCH_SIZE = 50_000
 
-            # Delete existing data
+            # Delete existing data for this tenant/loan_type
             if file_type == "loans":
-                session.query(Loan).filter_by(loan_type=loan_type).delete()
+                session.query(Loan).filter_by(tenant_id=tenant_id, loan_type=loan_type).delete()
             else:
-                session.query(Payment).filter_by(loan_type=loan_type).delete()
+                session.query(Payment).filter_by(tenant_id=tenant_id, loan_type=loan_type).delete()
             session.commit()
-
-            # Enable SQLite optimizations for bulk inserts
-            session.execute(text("PRAGMA synchronous=OFF"))
-            session.execute(text("PRAGMA cache_size=-64000"))
-            session.execute(text("PRAGMA temp_store=MEMORY"))
 
             # Stream CSV file and batch-insert
             total_inserted = 0
@@ -263,15 +258,14 @@ async def upload_csv(
 
                 for record in reader:
                     batch.append(record)
-                    # Update checksum incrementally
                     checksum_hash.update(str(sorted(record.items())).encode())
 
                     if len(batch) >= BATCH_SIZE:
                         batch_num += 1
                         if file_type == "loans":
-                            _insert_loan_batch(session, batch, loan_type)
+                            _insert_loan_batch(session, batch, tenant_id, loan_type)
                         else:
-                            _insert_payment_batch(session, batch, loan_type)
+                            _insert_payment_batch(session, batch, tenant_id, loan_type)
                         total_inserted += len(batch)
                         logger.info(
                             f"  [{tenant_id}] Batch {batch_num}: {total_inserted}/{total_lines} "
@@ -283,20 +277,36 @@ async def upload_csv(
                 if batch:
                     batch_num += 1
                     if file_type == "loans":
-                        _insert_loan_batch(session, batch, loan_type)
+                        _insert_loan_batch(session, batch, tenant_id, loan_type)
                     else:
-                        _insert_payment_batch(session, batch, loan_type)
+                        _insert_payment_batch(session, batch, tenant_id, loan_type)
                     total_inserted += len(batch)
 
-            # Restore PRAGMA and update version
-            session.execute(text("PRAGMA synchronous=FULL"))
+            # Update version and record file upload
             checksum = checksum_hash.hexdigest()[:16]
-            new_version = update_version(session, file_type, loan_type, total_inserted, checksum)
+            new_version = update_version(
+                session, tenant_id, file_type, loan_type,
+                total_inserted, checksum, object_key,
+            )
+
+            # Record the file upload history
+            upload_record = FileUpload(
+                tenant_id=tenant_id,
+                file_type=file_type,
+                loan_type=loan_type,
+                version=new_version,
+                filename=file.filename,
+                minio_object_key=object_key,
+                file_size=total_size,
+                record_count=total_inserted,
+                checksum=checksum,
+            )
+            session.add(upload_record)
             session.commit()
 
             logger.info(
                 f"[{tenant_id}] {file_type}/{loan_type} upload completed - "
-                f"{total_inserted} records, version: {new_version}"
+                f"{total_inserted} records, version: {new_version}, MinIO: {object_key}"
             )
 
             return UploadResponse(
@@ -307,6 +317,7 @@ async def upload_csv(
                 loan_type=loan_type,
                 records_processed=total_inserted,
                 version=new_version,
+                minio_object_key=object_key,
             )
 
         except Exception as e:
@@ -322,10 +333,11 @@ async def upload_csv(
             os.unlink(tmp_path)
 
 
-def _insert_loan_batch(session, records: list[dict], loan_type: str):
-    """Insert a batch of loan records using bulk_insert_mappings (memory-efficient)."""
+def _insert_loan_batch(session, records: list[dict], tenant_id: str, loan_type: str):
+    """Insert a batch of loan records using bulk_insert_mappings."""
     mappings = [
         {
+            "tenant_id": tenant_id,
             "loan_account_number": r.get("loan_account_number", ""),
             "loan_type": loan_type,
             "customer_id": r.get("customer_id", ""),
@@ -369,10 +381,11 @@ def _insert_loan_batch(session, records: list[dict], loan_type: str):
     session.commit()
 
 
-def _insert_payment_batch(session, records: list[dict], loan_type: str):
-    """Insert a batch of payment records using bulk_insert_mappings (memory-efficient)."""
+def _insert_payment_batch(session, records: list[dict], tenant_id: str, loan_type: str):
+    """Insert a batch of payment records using bulk_insert_mappings."""
     mappings = [
         {
+            "tenant_id": tenant_id,
             "payment_id": f"{r.get('loan_account_number', '')}_{r.get('installment_number', '0')}",
             "loan_account_number": r.get("loan_account_number", ""),
             "loan_type": loan_type,
@@ -403,15 +416,11 @@ async def get_data(
     loan_type: str = Query(..., description="Loan type: 'RETAIL' or 'COMMERCIAL'"),
     limit: Optional[int] = Query(None, ge=1, description="Maximum number of records to return"),
     offset: Optional[int] = Query(None, ge=0, description="Number of records to skip (pagination)"),
-    after_id: Optional[int] = Query(None, ge=0, description="Cursor: return records with id > after_id (efficient for large datasets)"),
+    after_id: Optional[int] = Query(None, ge=0, description="Cursor: return records with id > after_id"),
 ):
     """
     Returns the stored data for a specific tenant as JSON.
-
-    The Adapter service uses this endpoint to fetch data for processing.
-    Supports two pagination modes:
-      - **offset-based** (legacy): Uses SQL OFFSET — slow for large datasets.
-      - **cursor-based** (recommended): Uses `after_id` parameter — O(1) via primary key index.
+    Supports cursor-based pagination (after_id) for efficient large dataset access.
     """
     tenant_id = tenant_id.strip().upper()
     file_type = file_type.strip().lower()
@@ -423,12 +432,12 @@ async def get_data(
     if loan_type not in ("RETAIL", "COMMERCIAL"):
         raise HTTPException(status_code=400, detail="loan_type must be 'RETAIL' or 'COMMERCIAL'.")
 
-    session = get_session(tenant_id)
+    session = get_session()
     try:
         # Get version info
         version_entry = (
             session.query(DataVersion)
-            .filter_by(file_type=file_type, loan_type=loan_type)
+            .filter_by(tenant_id=tenant_id, file_type=file_type, loan_type=loan_type)
             .first()
         )
         current_version = version_entry.version if version_entry else None
@@ -436,18 +445,16 @@ async def get_data(
         Model = Loan if file_type == "loans" else Payment
         RecordSchema = LoanRecord if file_type == "loans" else PaymentRecord
 
-        # Total count (cached per query)
-        base_query = session.query(Model).filter_by(loan_type=loan_type)
+        # Total count
+        base_query = session.query(Model).filter_by(tenant_id=tenant_id, loan_type=loan_type)
         total = base_query.count()
 
         # Build paginated query
         query = base_query.order_by(Model.id)
 
         if after_id is not None:
-            # Cursor-based pagination: WHERE id > after_id ORDER BY id (uses PK index)
             query = query.filter(Model.id > after_id)
         elif offset:
-            # Legacy offset-based pagination (slow for large offsets)
             query = query.offset(offset)
 
         if limit:
@@ -478,15 +485,13 @@ async def get_version(
 ):
     """
     Returns all data versions for a tenant.
-
-    The Adapter service uses this endpoint to check if new data is available.
-    The version number is incremented on each upload.
+    Includes MinIO object keys for the sync service.
     """
     tenant_id = tenant_id.strip().upper()
-    session = get_session(tenant_id)
+    session = get_session()
 
     try:
-        versions = session.query(DataVersion).all()
+        versions = session.query(DataVersion).filter_by(tenant_id=tenant_id).all()
         version_list = [DataVersionInfo.model_validate(v) for v in versions]
 
         return VersionResponse(
@@ -495,6 +500,80 @@ async def get_version(
         )
     except Exception as e:
         logger.error(f"[{tenant_id}] Version query error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.get("/files/download", response_model=FileDownloadResponse)
+async def get_file_download_url(
+    tenant_id: str = Query(..., description="Bank/Tenant identifier"),
+    file_type: str = Query(..., description="File type: 'loans' or 'payments'"),
+    loan_type: str = Query(..., description="Loan type: 'RETAIL' or 'COMMERCIAL'"),
+    version: Optional[int] = Query(None, description="Specific version (default: latest)"),
+):
+    """
+    Get a presigned MinIO URL to download the CSV file for a specific version.
+    If version is not specified, returns the latest version.
+
+    Used by the sync service to download files directly from MinIO
+    instead of paginating through the /data endpoint.
+    """
+    tenant_id = tenant_id.strip().upper()
+    file_type = file_type.strip().lower()
+    loan_type = loan_type.strip().upper()
+
+    session = get_session()
+    try:
+        if version:
+            upload = (
+                session.query(FileUpload)
+                .filter_by(
+                    tenant_id=tenant_id,
+                    file_type=file_type,
+                    loan_type=loan_type,
+                    version=version,
+                )
+                .first()
+            )
+        else:
+            upload = (
+                session.query(FileUpload)
+                .filter_by(
+                    tenant_id=tenant_id,
+                    file_type=file_type,
+                    loan_type=loan_type,
+                )
+                .order_by(FileUpload.version.desc())
+                .first()
+            )
+
+        if not upload:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No file found for {tenant_id}/{file_type}/{loan_type}"
+                + (f" v{version}" if version else ""),
+            )
+
+        # Generate presigned URL (valid for 1 hour)
+        presigned_url = mc.get_presigned_url(upload.minio_object_key)
+
+        return FileDownloadResponse(
+            tenant_id=tenant_id,
+            file_type=file_type,
+            loan_type=loan_type,
+            version=upload.version,
+            filename=upload.filename,
+            minio_object_key=upload.minio_object_key,
+            presigned_url=presigned_url,
+            file_size=upload.file_size,
+            record_count=upload.record_count,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{tenant_id}] File download URL error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         session.close()
@@ -513,8 +592,7 @@ async def health_check():
     tenants = list_tenants()
     return HealthResponse(
         status="healthy",
-        service="External Bank Simulation API",
-        database_dir=DATABASE_DIR,
+        service="External Bank Simulation API (PostgreSQL + MinIO)",
         active_tenants=len(tenants),
     )
 
@@ -524,7 +602,20 @@ async def health_check():
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 60)
-    logger.info("External Bank Simulation API started (v2.0.0)")
-    logger.info(f"Database directory: {DATABASE_DIR}")
-    logger.info(f"Active tenants: {len(list_tenants())}")
+    logger.info("External Bank Simulation API started (v3.0.0)")
+    logger.info("Backend: PostgreSQL + MinIO")
     logger.info("=" * 60)
+
+    # Initialize PostgreSQL tables
+    try:
+        init_db()
+        logger.info("PostgreSQL database initialized")
+    except Exception as e:
+        logger.error(f"PostgreSQL initialization failed: {e}")
+
+    # Initialize MinIO bucket
+    try:
+        mc.ensure_bucket()
+        logger.info(f"MinIO bucket ready: {mc.MINIO_BUCKET}")
+    except Exception as e:
+        logger.error(f"MinIO initialization failed: {e}")

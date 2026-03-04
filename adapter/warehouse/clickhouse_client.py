@@ -14,6 +14,7 @@ Expanded schema to store full Turkish banking credit portfolio fields.
 
 import logging
 import math
+import time
 from datetime import datetime, date
 from typing import Optional
 from clickhouse_driver import Client as CHDriver
@@ -332,30 +333,56 @@ class ClickHouseClient:
         )
         logger.info(f"Loaded {len(rows)} payment records into staging for tenant '{tenant_id}'")
 
-    def swap_staging_to_production(self, table_name: str, tenant_id: str):
+    def swap_staging_to_production(self, table_name: str, tenant_id: str, loan_type: str = None):
         """
-        Atomically replace production data with staging data for a specific tenant.
+        Atomically replace production data with staging data for a specific
+        tenant AND loan_type combination.
 
         Strategy:
-        1. Delete existing tenant data from production table.
+        1. Delete existing tenant+loan_type data from production table.
         2. Insert staging data into production table.
         3. Drop the staging table.
 
-        This ensures zero-downtime updates per tenant while preserving
-        other tenants' data.
+        CRITICAL: The DELETE must filter by BOTH tenant_id AND loan_type
+        to preserve data for other loan_types of the same tenant.
+        E.g., uploading COMMERCIAL data must NOT delete RETAIL data.
 
         Args:
             table_name: Base table name ('loans' or 'payments').
             tenant_id: Tenant whose data is being replaced.
+            loan_type: Loan type being replaced ('RETAIL' or 'COMMERCIAL').
+                       If None, replaces ALL data for the tenant (legacy behavior).
         """
         staging_name = f"{table_name}_staging"
 
         try:
-            # Step 1: Remove old tenant data from production
-            self._execute(
-                f"ALTER TABLE {table_name} DELETE WHERE tenant_id = %(tenant_id)s",
-                {"tenant_id": tenant_id},
-            )
+            # Step 1: Remove old tenant+loan_type data from production
+            if loan_type:
+                self._execute(
+                    f"ALTER TABLE {table_name} DELETE "
+                    f"WHERE tenant_id = %(tenant_id)s AND loan_type = %(loan_type)s",
+                    {"tenant_id": tenant_id, "loan_type": loan_type},
+                )
+                logger.info(
+                    f"Deleted existing {table_name} data for "
+                    f"tenant='{tenant_id}', loan_type='{loan_type}'"
+                )
+            else:
+                self._execute(
+                    f"ALTER TABLE {table_name} DELETE WHERE tenant_id = %(tenant_id)s",
+                    {"tenant_id": tenant_id},
+                )
+
+            # ClickHouse DELETE is async — wait for mutations to complete
+            for _ in range(30):
+                mutations = self._execute(
+                    "SELECT count() FROM system.mutations "
+                    "WHERE is_done = 0 AND database = %(db)s AND table = %(tbl)s",
+                    {"db": self.database, "tbl": table_name},
+                )
+                if mutations and mutations[0][0] == 0:
+                    break
+                time.sleep(0.5)
 
             # Step 2: Move staging data to production
             self._execute(
@@ -370,6 +397,7 @@ class ClickHouseClient:
             logger.info(
                 f"Atomic swap completed: {staging_name} -> {table_name} "
                 f"for tenant '{tenant_id}'"
+                + (f", loan_type '{loan_type}'" if loan_type else "")
             )
 
         except Exception as e:

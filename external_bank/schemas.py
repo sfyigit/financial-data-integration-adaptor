@@ -1,7 +1,8 @@
 """
 Pydantic Schemas - API Request/Response models.
 
-Expanded to support full Turkish banking credit portfolio fields.
+Expanded to support full Turkish banking credit portfolio fields
+and MinIO file download endpoints.
 """
 
 from datetime import datetime
@@ -14,6 +15,7 @@ from typing import Optional
 class LoanRecord(BaseModel):
     """Single loan record — covers both retail and commercial credits."""
     id: Optional[int] = None  # DB primary key (used for cursor-based pagination)
+    tenant_id: Optional[str] = None
     # Core identifiers
     loan_account_number: str
     loan_type: str
@@ -81,6 +83,7 @@ class LoanRecord(BaseModel):
 class PaymentRecord(BaseModel):
     """Single payment / installment record."""
     id: Optional[int] = None  # DB primary key (used for cursor-based pagination)
+    tenant_id: Optional[str] = None
     payment_id: str
     loan_account_number: str
     loan_type: str
@@ -116,12 +119,14 @@ class PaymentRecord(BaseModel):
 
 class DataVersionInfo(BaseModel):
     """Data version information."""
+    tenant_id: Optional[str] = None
     file_type: str
     loan_type: str
     version: int
     record_count: int
     last_updated: Optional[datetime] = None
     checksum: Optional[str] = None
+    minio_object_key: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -138,6 +143,7 @@ class UploadResponse(BaseModel):
     loan_type: str
     records_processed: int
     version: int
+    minio_object_key: Optional[str] = None
 
 
 class DataResponse(BaseModel):
@@ -156,6 +162,19 @@ class VersionResponse(BaseModel):
     versions: list[DataVersionInfo]
 
 
+class FileDownloadResponse(BaseModel):
+    """Presigned URL response for file download."""
+    tenant_id: str
+    file_type: str
+    loan_type: str
+    version: int
+    filename: str
+    minio_object_key: str
+    presigned_url: str
+    file_size: Optional[int] = None
+    record_count: Optional[int] = None
+
+
 class TenantListResponse(BaseModel):
     """List of available tenants."""
     tenants: list[str]
@@ -166,7 +185,6 @@ class HealthResponse(BaseModel):
     """System health status."""
     status: str
     service: str
-    database_dir: str
     active_tenants: int
 
 
