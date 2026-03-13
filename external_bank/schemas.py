@@ -126,7 +126,6 @@ class DataVersionInfo(BaseModel):
     record_count: int
     last_updated: Optional[datetime] = None
     checksum: Optional[str] = None
-    minio_object_key: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -143,7 +142,6 @@ class UploadResponse(BaseModel):
     loan_type: str
     records_processed: int
     version: int
-    minio_object_key: Optional[str] = None
 
 
 class DataResponse(BaseModel):
@@ -162,17 +160,6 @@ class VersionResponse(BaseModel):
     versions: list[DataVersionInfo]
 
 
-class FileDownloadResponse(BaseModel):
-    """Presigned URL response for file download."""
-    tenant_id: str
-    file_type: str
-    loan_type: str
-    version: int
-    filename: str
-    minio_object_key: str
-    presigned_url: str
-    file_size: Optional[int] = None
-    record_count: Optional[int] = None
 
 
 class TenantListResponse(BaseModel):

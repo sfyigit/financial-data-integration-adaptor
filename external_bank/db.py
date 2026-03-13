@@ -14,10 +14,9 @@ from models import Base
 
 logger = logging.getLogger("external_bank.db")
 
-DATABASE_URL = os.environ.get(
-    "EXTERNAL_BANK_DB_URL",
-    "postgresql://fsec_user:fsec_pg_pass_2026@postgres_db:5432/fsec_db",
-)
+DATABASE_URL = os.environ.get("EXTERNAL_BANK_DB_URL")
+if not DATABASE_URL:
+    raise RuntimeError("EXTERNAL_BANK_DB_URL environment variable must be set.")
 
 # Use a schema prefix so external_bank tables don't clash with Django tables
 SCHEMA = "ext_bank"

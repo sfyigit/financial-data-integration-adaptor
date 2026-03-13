@@ -15,7 +15,7 @@ from django.contrib.auth.decorators import login_required
 from django.shortcuts import render, get_object_or_404
 from django.utils import timezone
 from rest_framework import viewsets, status
-from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.decorators import api_view, permission_classes, action, throttle_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 
@@ -30,6 +30,7 @@ from .permissions import (
     get_tenant_for_user, get_user_tenants,
 )
 from .authentication import APIKeyUser
+from .throttling import BurstRateThrottle
 
 logger = logging.getLogger("adapter")
 
@@ -121,6 +122,7 @@ class SyncLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([BurstRateThrottle])
 def trigger_sync(request):
     """
     Manually trigger a data sync for a specific tenant.
@@ -497,8 +499,13 @@ def api_data_tables(request):
 
     except Exception as e:
         logger.error(f"Data tables query error: {e}", exc_info=True)
+        message = (
+            "ClickHouse query failed."
+            if not settings.DEBUG
+            else f"ClickHouse query failed: {str(e)}"
+        )
         return Response(
-            {"error": f"ClickHouse query failed: {str(e)}"},
+            {"error": message},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
@@ -545,7 +552,9 @@ def api_upload_csv(request):
     if not tenant_id:
         return Response({"error": "tenant_id is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not Tenant.objects.filter(tenant_id=tenant_id).exists():
+    try:
+        tenant = Tenant.objects.get(tenant_id=tenant_id)
+    except Tenant.DoesNotExist:
         return Response(
             {"error": f"Tenant '{tenant_id}' does not exist."},
             status=status.HTTP_404_NOT_FOUND,
@@ -566,8 +575,32 @@ def api_upload_csv(request):
     if not csv_file:
         return Response({"error": "CSV file is required."}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not csv_file.name.endswith(".csv"):
+    if not csv_file.name.lower().endswith(".csv"):
         return Response({"error": "Only CSV files are accepted."}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Basic content type and size checks (defense in depth)
+    max_size_bytes = 1024 * 1024 * 1024  # 1GB hard cap
+    if csv_file.size > max_size_bytes:
+        return Response(
+            {"error": "Uploaded file is too large."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # Enforce tenant isolation for API uploads as well
+    user = request.user
+    if not (hasattr(user, "is_superuser") and user.is_superuser):
+        if isinstance(user, APIKeyUser):
+            if user.tenant.pk != tenant.pk:
+                return Response(
+                    {"error": "You do not have access to this tenant."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+        else:
+            if not TenantMembership.objects.filter(user=user, tenant=tenant).exists():
+                return Response(
+                    {"error": "You do not have access to this tenant."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
     # --- Forward to External Bank ---
     try:
@@ -626,7 +659,13 @@ def api_upload_csv(request):
             status=status.HTTP_502_BAD_GATEWAY,
         )
     except Exception as e:
+        logger.error(f"CSV API upload unexpected error: {e}", exc_info=True)
+        message = (
+            "Unexpected server error during CSV upload."
+            if not settings.DEBUG
+            else f"Unexpected error: {str(e)}"
+        )
         return Response(
-            {"error": f"Unexpected error: {str(e)}"},
+            {"error": message},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )

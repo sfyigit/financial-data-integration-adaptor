@@ -4,29 +4,23 @@ Sync Service - Main Orchestrator
 Coordinates the full data synchronization pipeline between
 the External Bank API and the ClickHouse Data Warehouse.
 
-Architecture (v3 — PostgreSQL + MinIO):
+Architecture (v4 — PostgreSQL only):
     1. Check External Bank /version for new data.
-    2. If new version detected, get presigned URL for CSV from /files/download.
-    3. Download CSV from MinIO via presigned URL (streaming).
-    4. Validate all records (field-level + cross-file integrity).
-    5. If validation fails → log errors, abort, preserve existing data.
-    6. If validation passes → normalize all records (in batches).
-    7. Load normalized data into ClickHouse staging table.
-    8. Perform atomic swap (staging → production) with tenant+loan_type isolation.
-    9. Update sync state and compute data profiling stats.
+    2. Fetch data via JSON cursor pagination (/data endpoint).
+    3. Validate all records (field-level + cross-file integrity).
+    4. If validation fails → log errors, abort, preserve existing data.
+    5. If validation passes → normalize all records (in batches).
+    6. Load normalized data into ClickHouse staging table (100k batches).
+    7. Perform atomic swap (staging → production) with tenant+loan_type isolation.
+    8. Update sync state and compute data profiling stats.
 
-Key improvements over v2:
-    - Downloads CSV directly from MinIO (no cursor pagination needed).
+Key improvements:
+    - Removed MinIO dependency, uses direct JSON cursor pagination.
     - loan_type-aware atomic swap (fixes data isolation bug).
-    - Streaming CSV processing (constant memory usage for any file size).
+    - Batch processing: 50k records fetched, 100k batches for ClickHouse.
 """
 
-import csv
-import io
-import os
-import tempfile
 import logging
-from datetime import datetime
 from typing import Optional
 
 import requests
@@ -39,15 +33,12 @@ from adapter.warehouse.clickhouse_client import ClickHouseClient
 
 logger = logging.getLogger("adapter.sync_service")
 
-# Timeout for downloading CSV files from MinIO (seconds)
-DOWNLOAD_TIMEOUT = 300
+# Batch size for fetching data from External Bank API (JSON cursor pagination)
+CHUNK_SIZE = 50_000
+FETCH_TIMEOUT = 120
 
 # Batch size for normalize + ClickHouse load (limits peak memory)
 NORMALIZE_BATCH_SIZE = 100_000
-
-# Fallback: max records per /data API call (if MinIO download fails)
-CHUNK_SIZE = 50_000
-FETCH_TIMEOUT = 120
 
 
 class SyncService:
@@ -103,7 +94,6 @@ class SyncService:
             target_file_type = target["file_type"]
             target_loan_type = target["loan_type"]
             remote_version = target["version"]
-            minio_object_key = target.get("minio_object_key")
 
             # Create sync log entry
             sync_log = SyncLog.objects.create(
@@ -120,7 +110,6 @@ class SyncService:
                     loan_type=target_loan_type,
                     remote_version=remote_version,
                     sync_log=sync_log,
-                    minio_object_key=minio_object_key,
                 )
                 results.append(result)
 
@@ -156,7 +145,6 @@ class SyncService:
         loan_type: str,
         remote_version: int,
         sync_log,
-        minio_object_key: str = None,
     ) -> dict:
         """
         Sync a single file_type/loan_type combination.
@@ -182,23 +170,9 @@ class SyncService:
         sync_log.save()
 
         # =====================================================================
-        # Step 1: Fetch data — try MinIO first, fall back to /data API
+        # Step 1: Fetch data via JSON cursor pagination
         # =====================================================================
-        records = None
-        if minio_object_key:
-            try:
-                records = self._fetch_data_from_minio(tenant_id, minio_object_key)
-                logger.info(
-                    f"[{tenant_id}] Downloaded {len(records)} records from MinIO: {minio_object_key}"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[{tenant_id}] MinIO download failed, falling back to /data API: {e}"
-                )
-                records = None
-
-        if records is None:
-            records = self._fetch_data(tenant_id, file_type, loan_type)
+        records = self._fetch_data(tenant_id, file_type, loan_type)
 
         sync_log.records_fetched = len(records)
         sync_log.save()
@@ -274,6 +248,7 @@ class SyncService:
 
         # =====================================================================
         # Steps 4+5: Normalize records in batches + Load into ClickHouse
+        # Process in 100k batches for ClickHouse staging
         # =====================================================================
         table_name = file_type
         total_normalized = 0
@@ -281,6 +256,7 @@ class SyncService:
         try:
             self.ch_client.create_staging_table(table_name)
 
+            # Process records in 100k batches
             for batch_start in range(0, len(records), NORMALIZE_BATCH_SIZE):
                 batch_end = min(batch_start + NORMALIZE_BATCH_SIZE, len(records))
                 batch = records[batch_start:batch_end]
@@ -288,12 +264,9 @@ class SyncService:
 
                 if file_type == "loans":
                     normalized_batch = [Normalizer.normalize_loan_record(r) for r in batch]
-                else:
-                    normalized_batch = [Normalizer.normalize_payment_record(r) for r in batch]
-
-                if file_type == "loans":
                     self.ch_client.load_loans_to_staging(tenant_id, normalized_batch)
                 else:
+                    normalized_batch = [Normalizer.normalize_payment_record(r) for r in batch]
                     self.ch_client.load_payments_to_staging(tenant_id, normalized_batch)
 
                 total_normalized += len(normalized_batch)
@@ -370,7 +343,6 @@ class SyncService:
     ) -> list[dict]:
         """
         Determine which file_type/loan_type combinations need syncing.
-        Now includes minio_object_key from the version response.
         """
         from tenants.models import Tenant, SyncState
 
@@ -391,7 +363,6 @@ class SyncService:
             remote_ft = rv["file_type"]
             remote_lt = rv["loan_type"]
             remote_ver = rv["version"]
-            minio_key = rv.get("minio_object_key")
 
             if file_type and remote_ft != file_type:
                 continue
@@ -410,95 +381,9 @@ class SyncService:
                     "file_type": remote_ft,
                     "loan_type": remote_lt,
                     "version": remote_ver,
-                    "minio_object_key": minio_key,
                 })
 
         return targets
-
-    def _fetch_data_from_minio(
-        self,
-        tenant_id: str,
-        minio_object_key: str,
-    ) -> list[dict]:
-        """
-        Download a CSV file from MinIO via the External Bank's presigned URL endpoint,
-        then parse it into a list of record dictionaries.
-
-        This is much faster than paginating through /data for large datasets.
-        """
-        # Get presigned URL from External Bank
-        # We'll extract file_type/loan_type from the minio_object_key
-        parts = minio_object_key.split("/")
-        if len(parts) >= 3:
-            eb_file_type = parts[1]
-            eb_loan_type = parts[2]
-        else:
-            raise ValueError(f"Cannot parse minio_object_key: {minio_object_key}")
-
-        url = (
-            f"{self.external_bank_url}/files/download"
-            f"?tenant_id={tenant_id}"
-            f"&file_type={eb_file_type}"
-            f"&loan_type={eb_loan_type}"
-        )
-
-        try:
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            download_info = response.json()
-        except requests.RequestException as e:
-            raise RuntimeError(f"Failed to get presigned URL: {e}")
-
-        presigned_url = download_info.get("presigned_url")
-        if not presigned_url:
-            raise RuntimeError("No presigned_url in response")
-
-        # Download the CSV from MinIO
-        logger.info(f"[{tenant_id}] Downloading CSV from MinIO ({minio_object_key})...")
-
-        try:
-            csv_response = requests.get(presigned_url, timeout=DOWNLOAD_TIMEOUT, stream=True)
-            csv_response.raise_for_status()
-        except requests.RequestException as e:
-            raise RuntimeError(f"Failed to download CSV from MinIO: {e}")
-
-        # Stream CSV to a temp file to avoid holding everything in memory
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv", prefix="minio_download_")
-        try:
-            total_bytes = 0
-            with os.fdopen(tmp_fd, "wb") as tmp_f:
-                for chunk in csv_response.iter_content(chunk_size=8 * 1024 * 1024):
-                    if chunk:
-                        tmp_f.write(chunk)
-                        total_bytes += len(chunk)
-
-            logger.info(
-                f"[{tenant_id}] Downloaded {total_bytes / (1024*1024):.1f} MB from MinIO"
-            )
-
-            # Parse CSV
-            records = []
-            with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
-                # Detect delimiter
-                first_line = f.readline()
-                f.seek(0)
-                delimiter = ";" if ";" in first_line else ","
-
-                reader = csv.DictReader(f, delimiter=delimiter)
-                for row in reader:
-                    if any(v and v.strip() for v in row.values()):
-                        cleaned = {
-                            k.strip().lower(): (v.strip() if v else "")
-                            for k, v in row.items()
-                            if k is not None
-                        }
-                        records.append(cleaned)
-
-            return records
-
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
 
     def _fetch_data(
         self,
@@ -507,8 +392,8 @@ class SyncService:
         loan_type: str,
     ) -> list[dict]:
         """
-        Fetch data from the External Bank API via cursor-based pagination.
-        This is the fallback method when MinIO download is not available.
+        Fetch data from the External Bank API via JSON cursor-based pagination.
+        Fetches 50k records per request, accumulates until ready for processing.
         """
         all_records = []
         after_id = 0

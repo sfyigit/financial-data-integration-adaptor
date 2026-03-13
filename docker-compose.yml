@@ -1,47 +1,16 @@
 services:
-  # 0. Object Storage (MinIO S3-compatible)
-  minio:
-    image: minio/minio
-    container_name: minio_s3
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fsec_minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fsec_minio_secret_2026}
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9002:9000"
-      - "9001:9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      fsec_network:
-        aliases:
-          - minio-s3
-
-  # 1. External Bank Simulation (FastAPI) — now uses PostgreSQL + MinIO
+  # 1. External Bank Simulation (FastAPI) — PostgreSQL-backed
   external_bank:
     build: ./external_bank
     container_name: external_bank_api
     env_file: .env
     environment:
       - EXTERNAL_BANK_DB_URL=postgresql://${POSTGRES_USER:-fsec_user}:${POSTGRES_PASSWORD:-fsec_pg_pass_2026}@postgres_db:5432/${POSTGRES_DB:-fsec_db}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-fsec_minio}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-fsec_minio_secret_2026}
-      - MINIO_BUCKET=fsec-data
     ports:
       - "8001:8000"
     restart: unless-stopped
     depends_on:
       postgres_db:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -136,10 +105,6 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
       - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-fsec_minio}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-fsec_minio_secret_2026}
-      - MINIO_BUCKET=fsec-data
     depends_on:
       postgres_db:
         condition: service_healthy
@@ -148,8 +113,6 @@ services:
       redis:
         condition: service_healthy
       external_bank:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -173,10 +136,6 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
       - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-fsec_minio}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-fsec_minio_secret_2026}
-      - MINIO_BUCKET=fsec-data
     depends_on:
       redis:
         condition: service_healthy
@@ -185,8 +144,6 @@ services:
       clickhouse:
         condition: service_healthy
       external_bank:
-        condition: service_healthy
-      minio:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -264,4 +221,3 @@ volumes:
   grafana_data:
   prometheus_data:
   static_files:
-  minio_data:

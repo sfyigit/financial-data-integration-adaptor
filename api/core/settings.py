@@ -17,7 +17,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # =============================================================================
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret-key-change-in-production")
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    # Fail fast if SECRET_KEY is not provided; prevents accidentally running with a weak key.
+    raise RuntimeError("DJANGO_SECRET_KEY environment variable must be set.")
 DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "yes")
 
 # ALLOWED_HOSTS — restrict in production
@@ -55,8 +58,13 @@ else:
 
 # Session settings
 SESSION_ENGINE = "django.contrib.sessions.backends.db"
-SESSION_COOKIE_AGE = 86400  # 24 hours
-SESSION_EXPIRE_AT_BROWSER_CLOSE = False
+# Shorter sessions and browser-close expiry in production for better security
+if DEBUG:
+    SESSION_COOKIE_AGE = 86400  # 24 hours in development
+    SESSION_EXPIRE_AT_BROWSER_CLOSE = False
+else:
+    SESSION_COOKIE_AGE = int(os.environ.get("SESSION_COOKIE_AGE", "28800"))  # 8 hours
+    SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 
 # =============================================================================
 # Installed Apps
@@ -118,10 +126,9 @@ WSGI_APPLICATION = "core.wsgi.application"
 # Database (PostgreSQL)
 # =============================================================================
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgres://fsec_user:fsec_pg_pass_2026@localhost:5432/fsec_db",
-)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable must be set.")
 
 # Parse DATABASE_URL
 _db_parts = DATABASE_URL.replace("postgres://", "").split("@")
@@ -187,7 +194,8 @@ if _cors_origins:
     CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors_origins.split(",") if o.strip()]
     CORS_ALLOW_ALL_ORIGINS = False
 else:
-    CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all only in development
+    # CORS_ALLOW_ALL_ORIGINS is never enabled implicitly; must be explicitly turned on.
+    CORS_ALLOW_ALL_ORIGINS = os.environ.get("CORS_ALLOW_ALL_ORIGINS", "False").lower() in ("true", "1")
     CORS_ALLOWED_ORIGINS = []
 
 CORS_ALLOW_CREDENTIALS = True
@@ -213,9 +221,10 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.UserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
-        "anon": os.environ.get("THROTTLE_ANON_RATE", "100/hour"),
-        "user": os.environ.get("THROTTLE_USER_RATE", "5000/hour"),
-        "auth": os.environ.get("THROTTLE_AUTH_RATE", "30/minute"),
+        "anon": os.environ.get("THROTTLE_ANON_RATE", "60/hour"),
+        "user": os.environ.get("THROTTLE_USER_RATE", "1000/hour"),
+        "auth": os.environ.get("THROTTLE_AUTH_RATE", "10/minute"),
+        "burst": os.environ.get("THROTTLE_BURST_RATE", "60/minute"),
     },
     # Exception handling
     "EXCEPTION_HANDLER": "rest_framework.views.exception_handler",

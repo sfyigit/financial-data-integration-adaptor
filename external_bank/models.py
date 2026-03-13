@@ -195,7 +195,7 @@ class FileUpload(Base):
     loan_type = Column(String(20), nullable=False)
     version = Column(Integer, nullable=False)
     filename = Column(String(255), nullable=False)
-    minio_object_key = Column(String(500), nullable=False)
+    minio_object_key = Column(String(500), nullable=True)  # Deprecated, kept for backward compatibility
     file_size = Column(BigInteger, nullable=True)
     record_count = Column(Integer, nullable=True)
     checksum = Column(String(64), nullable=True)

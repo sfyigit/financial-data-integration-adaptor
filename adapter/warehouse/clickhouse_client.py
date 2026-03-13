@@ -14,6 +14,7 @@ Expanded schema to store full Turkish banking credit portfolio fields.
 
 import logging
 import math
+import re
 import time
 from datetime import datetime, date
 from typing import Optional
@@ -55,9 +56,15 @@ class ClickHouseClient:
         from django.conf import settings
         self.host = host or getattr(settings, "CLICKHOUSE_HOST", "localhost")
         self.port = port or getattr(settings, "CLICKHOUSE_PORT", 9000)
-        self.database = database or getattr(settings, "CLICKHOUSE_DATABASE", "fsec")
+        raw_db = database or getattr(settings, "CLICKHOUSE_DATABASE", "fsec")
+        # Allow only safe database names (alphanumeric + underscore)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", raw_db):
+            raise ValueError("Invalid ClickHouse database name.")
+        self.database = raw_db
         self.user = user or getattr(settings, "CLICKHOUSE_USER", "default")
-        self.password = password or getattr(settings, "CLICKHOUSE_PASSWORD", "clickhouse123")
+        self.password = password or getattr(settings, "CLICKHOUSE_PASSWORD")
+        if self.password is None:
+            raise RuntimeError("CLICKHOUSE_PASSWORD setting must be configured.")
         self._client = None
 
     @property
@@ -221,6 +228,8 @@ class ClickHouseClient:
         Create a staging table with the same structure as the production table.
         Drops existing staging table first to ensure clean state.
         """
+        if table_name not in ("loans", "payments"):
+            raise ValueError("Invalid table name for staging creation.")
         staging_name = f"{table_name}_staging"
         self._execute(f"DROP TABLE IF EXISTS {staging_name}")
         self._execute(f"CREATE TABLE {staging_name} AS {table_name}")
@@ -353,6 +362,8 @@ class ClickHouseClient:
             loan_type: Loan type being replaced ('RETAIL' or 'COMMERCIAL').
                        If None, replaces ALL data for the tenant (legacy behavior).
         """
+        if table_name not in ("loans", "payments"):
+            raise ValueError("Invalid table name for atomic swap.")
         staging_name = f"{table_name}_staging"
 
         try:
@@ -374,7 +385,8 @@ class ClickHouseClient:
                 )
 
             # ClickHouse DELETE is async — wait for mutations to complete
-            for _ in range(30):
+            # Wait up to ~60 seconds (120 * 0.5s) for large partitions.
+            for _ in range(120):
                 mutations = self._execute(
                     "SELECT count() FROM system.mutations "
                     "WHERE is_done = 0 AND database = %(db)s AND table = %(tbl)s",
@@ -411,6 +423,8 @@ class ClickHouseClient:
 
     def drop_staging_table(self, table_name: str):
         """Drop a staging table (used when validation fails)."""
+        if table_name not in ("loans", "payments"):
+            raise ValueError("Invalid table name for staging drop.")
         staging_name = f"{table_name}_staging"
         self._execute(f"DROP TABLE IF EXISTS {staging_name}")
         logger.info(f"Staging table '{staging_name}' dropped (validation failed)")

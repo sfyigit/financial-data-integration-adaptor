@@ -6,36 +6,37 @@
 2. [System Architecture](#2-system-architecture)
 3. [Service Components](#3-service-components)
 4. [Data Flow](#4-data-flow)
-5. [Multi-Tenancy](#5-multi-tenancy)
+5. [Multi-Tenancy & Isolation](#5-multi-tenancy--isolation)
 6. [Authentication & Authorization](#6-authentication--authorization)
 7. [Validation & Normalization](#7-validation--normalization)
-8. [Atomic Replacement](#8-atomic-replacement)
-9. [Background Tasks](#9-background-tasks)
+8. [Atomic Replacement (ClickHouse)](#8-atomic-replacement-clickhouse)
+9. [Background Tasks & Scheduling](#9-background-tasks--scheduling)
 10. [Data Warehouse & Profiling](#10-data-warehouse--profiling)
-11. [Monitoring](#11-monitoring)
+11. [Monitoring & Observability](#11-monitoring--observability)
 12. [Testing Strategy](#12-testing-strategy)
-13. [Infrastructure](#13-infrastructure)
+13. [Infrastructure & Docker Compose](#13-infrastructure--docker-compose)
 14. [Database Schema](#14-database-schema)
 15. [API Endpoints](#15-api-endpoints)
 16. [Error Handling & Resilience](#16-error-handling--resilience)
+17. [Possible Future Improvements](#17-possible-future-improvements)
 
 ---
 
 ## 1. Overview
 
-**FSec** is a multi-tenant SaaS platform that integrates with external banking systems. It extracts credit portfolio data, validates and normalizes it, then stores the processed data in ClickHouse for Asset-Backed Securities (ABS) analysis.
+**FSec** is a multi-tenant SaaS platform that integrates with external banking systems. It extracts credit portfolio data, validates and normalizes it, then stores the processed data in **ClickHouse** for Asset-Backed Securities (ABS) analysis.
 
 ### Core Design Principles
 
 | Principle | Description |
 |---|---|
-| **Tenant Isolation** | BANK001 can never see BANK002's data |
-| **Loan Type Isolation** | RETAIL and COMMERCIAL data coexist independently per tenant |
-| **All-or-Nothing** | If validation fails, existing data is preserved |
-| **Atomic Swap** | Staging → Production transition with zero downtime, scoped by tenant + loan_type |
-| **Periodic Sync** | Automated data update checks via Celery Beat |
-| **Streaming I/O** | Large files (200MB+) are streamed to MinIO, never fully loaded into memory |
-| **Observability** | Full-stack monitoring with Prometheus + Grafana |
+| **Tenant Isolation** | BANK001 data can never be accessed by BANK002. |
+| **Loan Type Isolation** | RETAIL and COMMERCIAL data coexist independently within the same tenant. |
+| **All-or-Nothing** | If a critical validation error occurs, **no** production data is modified. |
+| **Atomic Swap** | The staging → production transition in ClickHouse is performed atomically, scoped by tenant + loan_type. |
+| **Full Replacement** | New data for the same tenant + loan_type completely replaces existing data. |
+| **Periodic Sync** | Celery Beat periodically checks for updates from the external bank. |
+| **Observability** | End-to-end metrics and dashboards via Prometheus + Grafana. |
 
 ---
 
@@ -43,7 +44,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                     Docker Network (fsec_network)                     │
+│                        Docker Network (fsec_network)                 │
 │                                                                      │
 │  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐      │
 │  │  External     │    │  Django       │    │  ClickHouse       │      │
@@ -55,120 +56,132 @@
 │         │            ┌──────┴────────┐                               │
 │         │      ┌─────▼─────┐   ┌────▼─────────┐                     │
 │         │      │  Celery    │   │  Celery       │                    │
-│         │      │  Worker    │   │  Beat          │                   │
+│         │      │  Worker    │   │  Beat         │                    │
 │         │      └─────┬──────┘   └───────────────┘                   │
 │         │            │                                               │
 │  ┌──────▼──────┐     │      ┌───────────────┐                       │
-│  │   MinIO      │◄────┘     │  PostgreSQL    │                       │
-│  │   (S3)       │           │  :5432         │                       │
-│  │   :9000/:9001│           └───────────────┘                       │
-│  └──────────────┘    ┌──────────────┐                               │
-│                      │   Redis       │                               │
-│                      │   :6379       │                               │
-│                      └──────────────┘                               │
-│  ┌──────────────┐    ┌──────────────┐                               │
-│  │  Prometheus   │    │  Grafana      │                              │
-│  │  :9090        │    │  :3000        │                              │
-│  └──────────────┘    └──────────────┘                               │
+│  │  PostgreSQL  │◄────┘      │  Redis        │                       │
+│  │  (Django +   │            │  :6379        │                       │
+│  │  Ext. Bank)  │            └───────────────┘                       │
+│  │  :5432       │                                                    │
+│  └──────────────┘    ┌──────────────┐    ┌──────────────┐           │
+│                      │  Prometheus  │    │  Grafana     │           │
+│                      │  :9090       │    │  :3000       │           │
+│                      └──────────────┘    └──────────────┘           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key data path:** CSV uploads are streamed to **MinIO** via the External Bank API. The Adapter's sync service downloads CSVs from MinIO using **presigned URLs**, validates, normalizes, and loads them into **ClickHouse**.
+**Current data path:** Users upload CSV files to the **External Bank API** via the **Django Adapter API**. The External Bank writes data into **PostgreSQL** (under the `ext_bank` schema). The Adapter's **SyncService** fetches data from the External Bank using JSON cursor pagination, validates and normalizes it, then loads the results into **ClickHouse**.
 
 ---
 
 ## 3. Service Components
 
-### 3.1 External Bank API (FastAPI + PostgreSQL + MinIO)
+### 3.1 External Bank API (FastAPI + PostgreSQL)
 
-Simulates an external banking system. Uses a shared **PostgreSQL** database (multi-tenant via `tenant_id` column, `ext_bank` schema) for metadata and record storage, and **MinIO** (S3-compatible) for durable CSV file storage.
+Simulates an external banking system. Uses a single PostgreSQL database with a multi-tenant structure under the `ext_bank` schema. The CSV upload endpoint writes data directly to PostgreSQL.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/upload` | Upload CSV file → MinIO + PostgreSQL |
-| `GET` | `/data` | Return stored data as JSON (cursor-based pagination) |
-| `GET` | `/version` | Data version info (includes MinIO object keys) |
-| `GET` | `/files/download` | Get presigned MinIO URL for a specific version |
-| `GET` | `/tenants` | List existing tenants |
-| `GET` | `/health` | Service health check |
-
-**Key design:** Full replacement strategy — new data completely replaces existing data for the same `tenant_id` + `loan_type` combination. Each upload is tracked with a version number, SHA-256 checksum, and MinIO object key. CSV files are organized in MinIO as `{tenant_id}/{file_type}/{loan_type}/v{version}_{filename}`.
+| `POST` | `/upload` | CSV upload → PostgreSQL (ext_bank) |
+| `GET` | `/data` | JSON data (cursor-based pagination via `after_id`) |
+| `GET` | `/version` | Version info for a tenant (version, checksum, record_count) |
+| `GET` | `/tenants` | List of registered tenants |
+| `GET` | `/health` | Health check |
 
 **Upload flow:**
-1. Stream upload to temp file on disk (8MB chunks)
-2. Upload temp file to MinIO (S3)
-3. Delete existing PostgreSQL records for tenant+loan_type
-4. Parse CSV and bulk-insert into PostgreSQL (`bulk_insert_mappings`, 50K batch size)
-5. Update `DataVersion` with MinIO object key and metadata
-6. Record upload history in `FileUpload` table
-7. Clean up temp file
+1. CSV file is read and rows are parsed.
+2. Existing records for the given `tenant_id + loan_type` are deleted (full replacement).
+3. New rows are written to PostgreSQL in batches of 5K using `execute_values`.
+4. `DataVersion` and `FileUpload` records are updated (version, checksum, record_count).
 
-### 3.2 Django Adapter API
+### 3.2 Django Adapter API (Django + DRF)
 
-Main SaaS platform providing tenant management, sync orchestration, web UI, and REST API. Communicates with the External Bank API to forward CSV uploads and with ClickHouse for data warehousing.
+The multi-tenant SaaS layer. Provides tenant management, user & membership operations, sync orchestration, web UI, and REST API.
 
 ### 3.3 Adapter Business Logic Layer
 
 ```
 ┌────────────────────────────────────────┐
-│  Celery Tasks (sync_tasks.py)          │  ← Scheduling, triggers & concurrency guard
+│  Celery Tasks (sync_tasks.py)          │  ← scheduling, triggers, concurrency guard
 ├────────────────────────────────────────┤
-│  SyncService (sync_service.py)         │  ← Pipeline orchestration (MinIO download)
+│  SyncService (sync_service.py)         │  ← pipeline orchestration
 ├────────────────────────────────────────┤
-│  Validator          │  Normalizer      │  ← Business rules
+│  Validator          │  Normalizer      │  ← business rules
 ├────────────────────────────────────────┤
-│  ClickHouseClient                      │  ← Data warehouse ops (loan_type-aware swap)
+│  ClickHouseClient                      │  ← data warehouse operations (loan_type-aware swap)
 └────────────────────────────────────────┘
 ```
+
+### 3.4 Background Services
+
+- **Celery Worker** — Executes sync jobs.
+- **Celery Beat** — Periodically triggers the `check_for_updates` task.
+- **Redis** — Used as the Celery broker and result backend.
+
+### 3.5 Monitoring
+
+- **Prometheus** — Collects metrics from all services.
+- **Grafana** — Provides FSec-specific dashboards.
 
 ---
 
 ## 4. Data Flow
 
-### Sync Pipeline (v3 — MinIO-based)
-
-```
-Celery Beat (every 5 min) → check_for_updates() → version comparison
-    │
-    ▼ (if new data detected)
-run_sync_for_tenant() (async Celery task, with concurrency guard)
-    │
-    ├── Step 1: Get presigned URL from External Bank /files/download
-    ├── Step 2: Download CSV from MinIO via presigned URL (streaming)
-    │     └── Fallback: cursor-based pagination via /data API
-    ├── Step 3: Validate all records (field-level + cross-file)
-    │     ├── ✅ Pass → Step 4: Normalize
-    │     └── ❌ Fail → Log errors, PRESERVE existing data
-    ├── Step 4: Normalize (dates, rates, statuses) in 100K-record batches
-    ├── Step 5: Load normalized batches to ClickHouse staging table
-    ├── Step 6: Atomic swap (staging → production) with tenant+loan_type isolation
-    └── Step 7: Update SyncState + compute profiling
-```
-
 ### CSV Upload Flow
 
 ```
-User/API → Django (upload_csv) → Tenant existence check
-    ├── Tenant exists → Forward file to External Bank /upload
-    │     └── External Bank → Stream to temp file → MinIO + PostgreSQL
-    └── Tenant not found → HTTP 404
+User / API Client
+    ↓
+Django Adapter (/upload/ web page or /api/upload-csv/)
+    ↓  (does tenant exist? is user a member of this tenant? is file valid?)
+External Bank API (POST /upload)
+    ↓
+PostgreSQL — ext_bank.loans / ext_bank.payments
+```
 
-Large files (200MB+): Dynamic timeout (5s/MB, min 600s), streaming transfer
+- **On the Django side:**
+  - `tenant_id`, `file_type` (`loans` / `payments`), and `loan_type` (`RETAIL` / `COMMERCIAL`) are validated.
+  - The user's tenant membership is verified.
+  - File extension (`.csv`), size, and content type are checked.
+- **On the External Bank side:**
+  - Existing PostgreSQL records for `tenant_id + loan_type` are deleted.
+  - New rows are written in batches of 5K.
+  - `DataVersion` and `FileUpload` tables are updated.
+
+### Sync Pipeline (v4 — PostgreSQL-based)
+
+```
+Celery Beat (every 5 min) → check_for_updates()
+    │
+    ▼
+External Bank /version call for all active tenants
+    │
+    ▼
+For each new version: run_sync_for_tenant(tenant_id) [Celery task]
+    │
+    ├── Step 1: Fetch data from External Bank /data via JSON cursor pagination (50K chunks)
+    ├── Step 2: Field-level validation for all records
+    ├── Step 3: Cross-file integrity check for payments (does loan_id exist?)
+    │       └── On failure: SyncLog = failed, production data preserved
+    ├── Step 4: Normalize (dates, rates, statuses) — 100K batches
+    ├── Step 5: Batch insert into ClickHouse staging table
+    ├── Step 6: Atomic swap (staging → production), scoped by tenant + loan_type
+    └── Step 7: Update SyncState + compute profiling metrics
 ```
 
 ---
 
-## 5. Multi-Tenancy
+## 5. Multi-Tenancy & Isolation
 
 ### Isolation Layers
 
 | Layer | Mechanism |
 |---|---|
-| **External Bank (PostgreSQL)** | Logical — shared `ext_bank` schema, `tenant_id` column + filtered queries |
-| **External Bank (MinIO)** | Path-based — `{tenant_id}/{file_type}/{loan_type}/` object key prefix |
-| **ClickHouse** | Partition-based — `PARTITION BY tenant_id`, DELETE scoped by `tenant_id + loan_type` |
-| **PostgreSQL (Django)** | Logical — `TenantMembership` model, FK filtering |
-| **API** | Query filtering — `get_queryset()`, `IsTenantMember` permission |
+| **External Bank (PostgreSQL)** | `tenant_id` column + `ext_bank` schema + filtered queries |
+| **ClickHouse** | `PARTITION BY tenant_id`; DELETE and INSERT scoped by `tenant_id + loan_type` |
+| **PostgreSQL (Django)** | `Tenant` / `TenantMembership` models + FK relationships |
+| **API** | DRF permissions + queryset filters (`IsTenantMember`, `get_user_tenants`) |
 
 ### Access Matrix
 
@@ -186,98 +199,144 @@ Large files (200MB+): Dynamic timeout (5s/MB, min 600s), streaming transfer
 
 ## 6. Authentication & Authorization
 
-Three authentication mechanisms are supported simultaneously:
+The system supports three authentication mechanisms simultaneously:
 
-| Method | Use Case | Header / Mechanism |
+| Method | Use Case | Mechanism |
 |---|---|---|
 | **JWT** | Programmatic API access | `Authorization: Bearer <token>` |
 | **API Key** | Machine-to-machine (M2M) | `X-API-Key: <tenant-api-key>` |
-| **Session** | Web UI (dashboard, forms) | Django session cookie + CSRF |
+| **Session** | Web UI (dashboard & forms) | Django session cookie + CSRF |
 
-**JWT Config:** Access token = 2 hours, Refresh token = 7 days. Old tokens are blacklisted after rotation.
+- **JWT**:
+  - Access token: 2 hours by default (configurable via env).
+  - Refresh token: 7 days by default.
+  - Token rotation enabled; old tokens are blacklisted after rotation.
+- **API Key**:
+  - Each `Tenant` model has an `api_key` field.
+  - Requests authenticated via API key can only access that tenant's data.
+- **Session**:
+  - Dashboard, CSV upload, and data explorer pages use session auth.
+  - In production, session cookies are set as `Secure` and `HttpOnly`.
 
-**API Key:** Directly maps to a `Tenant`. Can only access its own tenant's data.
+### Permission Classes
+
+- `IsTenantMember` — Verifies that the user belongs to the requested tenant.
+- `IsTenantAdmin` — Required for sensitive operations that need a tenant admin role.
+- `IsAdminOrReadOnly` — Read: all authenticated users; Write: superusers only.
 
 ---
 
 ## 7. Validation & Normalization
 
-### Validation Rules
+### Field-Level Validation
 
-**Field-Level:**
+**Loan records:**
 
 | Field | Rule | Error Type |
 |---|---|---|
-| `loan_id` / `payment_id` | Required, unique | `missing_required`, `duplicate` |
-| `amount` | Numeric, 0 < x ≤ 100B | `invalid_type`, `range_violation` |
-| `interest_rate` | Parseable, 0.0 ≤ x ≤ 1.0 | `invalid_format`, `range_violation` |
-| `start_date` / `payment_date` | Parseable date | `invalid_format` |
-| `status` | Recognized label | `invalid_value` |
+| `loan_id` / `loan_account_number` | Required, unique | `missing_required`, `duplicate` |
+| `amount` / `original_loan_amount` | Numeric, `0 < x ≤ 100B` | `invalid_type`, `range_violation` |
+| `interest_rate` / `nominal_interest_rate` | Parseable, `0.0 ≤ x ≤ 1.0` | `invalid_format`, `range_violation` |
+| `start_date` / `loan_start_date` | Parseable date | `invalid_format` |
+| `status` / `loan_status_code` | Recognized label | `invalid_value` |
 
-**Cross-File Integrity:** Every payment's `loan_id` must exist in the loan dataset. Orphan payments cause the entire sync to abort.
+**Payment records:**
+
+| Field | Rule | Error Type |
+|---|---|---|
+| `payment_id` / `loan_account_number` | Required or derivable | `missing_required` |
+| `loan_id` / `loan_account_number` | Required | `missing_required` |
+| `payment_amount` / `installment_amount` | Numeric, `≥ 0` | `invalid_type`, `range_violation` |
+| `payment_date` / `actual_payment_date` / `scheduled_payment_date` | Parseable date | `invalid_format` |
+
+### Cross-File Integrity
+
+- Every payment record's `loan_id` must exist in the loan dataset.
+- If orphan payments are detected:
+  - The entire sync is **aborted**.
+  - The existing ClickHouse production data remains unchanged.
 
 ### Normalization Rules
 
-**Dates:** `DD/MM/YYYY`, `MM/DD/YYYY`, `YYYYMMDD`, `DD-MM-YYYY`, `DD.MM.YYYY` → `YYYY-MM-DD`
+**Date Formats:**
 
-**Interest Rates:** `18.5%` → `0.185` · `1850 bps` → `0.185` · `18.5` (>1) → `0.185`
+`DD/MM/YYYY`, `MM/DD/YYYY`, `YYYYMMDD`, `DD-MM-YYYY`, `DD.MM.YYYY` → `YYYY-MM-DD`
 
-**Status:** `Active/Open/Aktif` → `ACTIVE` · `Paid/Closed/Kapalı` → `CLOSED` · `Default/Gecikme` → `DEFAULT` · `Restructured/Yapılandırılmış` → `RESTRUCTURED`
+**Interest Rates:**
+
+| Input Value | Normalized |
+|---|---|
+| `"18.5%"` | `0.185` |
+| `"1850 bps"` | `0.185` |
+| `"18.5"` (treated as % if > 1) | `0.185` |
+
+**Status Labels:**
+
+| Input Value | Normalized |
+|---|---|
+| `Active`, `Open`, `Aktif` | `ACTIVE` |
+| `Paid`, `Closed`, `Kapalı` | `CLOSED` |
+| `Default`, `Gecikme` | `DEFAULT` |
+| `Restructured`, `Yapılandırılmış` | `RESTRUCTURED` |
+| Unrecognized values | `UNKNOWN` |
 
 ---
 
-## 8. Atomic Replacement
+## 8. Atomic Replacement (ClickHouse)
 
-ClickHouse data updates use a staging table mechanism with **tenant + loan_type isolation**:
+Data updates in ClickHouse are performed using a **staging table** approach.
+
+### Steps
 
 ```
 1. CREATE TABLE loans_staging AS loans
 2. INSERT normalized data INTO loans_staging
-3. ALTER TABLE loans DELETE WHERE tenant_id = 'BANK001' AND loan_type = 'RETAIL'
+3. ALTER TABLE loans DELETE
+     WHERE tenant_id = 'BANK001' AND loan_type = 'RETAIL'
 4. Wait for ClickHouse mutation to complete (async DELETE)
 5. INSERT INTO loans SELECT * FROM loans_staging WHERE tenant_id = 'BANK001'
 6. DROP TABLE loans_staging
 ```
 
-**Critical:** The DELETE in Step 3 filters by **both** `tenant_id` AND `loan_type`. This ensures that uploading COMMERCIAL data does not delete RETAIL data for the same tenant, and vice versa.
+**Critical:** The DELETE statement filters by **both** `tenant_id` **and** `loan_type`. This ensures:
 
-**Safety guarantees:**
+- Uploading COMMERCIAL data does not delete RETAIL data (and vice versa).
+- Other tenants' data is never affected.
+
+### Safety Guarantees
 
 | Scenario | Behavior |
 |---|---|
-| Staging load fails | Staging table is dropped, production unchanged |
-| Swap fails | Staging cleaned up, error logged |
-| Validation fails | Staging table is never created |
-| Other tenants' data | Isolated by `WHERE tenant_id`, unaffected |
-| Other loan_types' data | Isolated by `WHERE loan_type`, unaffected |
+| Staging load fails | Staging table is dropped; production remains unchanged. |
+| Swap fails | Staging is cleaned up, error is logged; production is preserved. |
+| Validation fails | Staging table is never created. |
+| Orphan payment detected | Sync aborted; production data preserved. |
+| Other tenants' data | Unaffected — scoped by `WHERE tenant_id`. |
+| Other loan_types' data | Unaffected — scoped by `WHERE loan_type`. |
 
-**Full Replacement:** 1000 records + 2000 new records = 2000 records (not 3000).
-
-**Loan Type Coexistence:** Uploading RETAIL data, then COMMERCIAL data = both exist independently and can be queried separately.
+**Full Replacement:** 1000 existing records + 2000 new records = **2000** records after sync (replace, not append).
 
 ---
 
-## 9. Background Tasks
+## 9. Background Tasks & Scheduling
 
 ```
 Celery Beat (scheduler)
-├── Every 5 minutes: check_for_updates()
-│   → Compare versions for all active tenants
-│   → Skip tenants with already-running syncs (concurrency guard)
-│   → If new data: dispatch run_sync_for_tenant.delay(tenant_id)
+├── Every 5 min: check_for_updates()
+│   → Calls External Bank /version for all active tenants
+│   → Skips tenants that already have a running sync (concurrency guard)
+│   → If new version detected: run_sync_for_tenant.delay(tenant_id)
 │
 Celery Worker (executor)
 ├── run_sync_for_tenant() → SyncService.sync_tenant()
-│   → Concurrency guard (prevents duplicate tasks per tenant)
-│   → Downloads CSV from MinIO via presigned URL
-│   → Validates, normalizes (100K batches), loads to ClickHouse
-│   → Performs tenant+loan_type-scoped atomic swap
-└── On failure: 2 retries with 30s delay, then marks SyncLogs as failed
+│   → Concurrency guard (only one sync job per tenant at a time)
+│   → Fetches data from External Bank /data in JSON chunks
+│   → Validate + normalize (100K batches) + load to ClickHouse staging
+│   → Atomic swap scoped by tenant + loan_type
+└── On failure: 2 retries with 30s delay, then SyncLog = failed
 ```
 
-**Concurrency Guard:** Only one sync task per tenant can run at a time. The `check_for_updates` task skips tenants with active `running` SyncLog entries, and `run_sync_for_tenant` checks for concurrent runs before proceeding.
-
-**Version Check Logic:** Compares both version number and SHA-256 checksum from External Bank API against local `SyncState`. Triggers sync if either has changed.
+**Version Check Logic:** A sync is triggered if either the `version` number **or** the `checksum` from the External Bank has changed. Identical data is never re-synced.
 
 ---
 
@@ -285,40 +344,46 @@ Celery Worker (executor)
 
 ### ClickHouse Tables
 
-**loans:** Full Turkish banking credit portfolio fields — `tenant_id, loan_id, loan_type, amount, outstanding_principal_balance, interest_rate, original_interest_rate, total_interest_amount, kkdf_rate, kkdf_amount, bsmv_rate, bsmv_amount, start_date, final_maturity_date, first_payment_date, loan_closing_date, original_start_date, status, original_status, loan_status_flag, days_past_due, customer_id, customer_type, total_installment_count, outstanding_installment_count, paid_installment_count, installment_frequency, grace_period_months, insurance_included, customer_district_code, customer_province_code, customer_region_code, internal_rating, external_rating, loan_product_type, sector_code, internal_credit_rating, default_probability, risk_class, customer_segment, synced_at`
+**loans** — Full credit portfolio fields:
 
-**payments:** `tenant_id, payment_id, loan_id, loan_type, installment_number, payment_date, actual_payment_date, scheduled_payment_date, original_payment_date, payment_amount, principal_component, interest_component, kkdf_component, bsmv_component, installment_status, remaining_principal, remaining_interest, remaining_kkdf, remaining_bsmv, synced_at`
+`tenant_id, loan_id, loan_type, amount, outstanding_principal_balance, interest_rate, original_interest_rate, total_interest_amount, kkdf_rate, kkdf_amount, bsmv_rate, bsmv_amount, start_date, final_maturity_date, first_payment_date, loan_closing_date, original_start_date, status, original_status, loan_status_flag, days_past_due, customer_id, customer_type, total_installment_count, outstanding_installment_count, paid_installment_count, installment_frequency, grace_period_months, insurance_included, customer_district_code, customer_province_code, customer_region_code, internal_rating, external_rating, loan_product_type, sector_code, internal_credit_rating, default_probability, risk_class, customer_segment, synced_at`
 
-Both tables use `MergeTree()` engine with `PARTITION BY tenant_id` and `ORDER BY (tenant_id, loan_type, loan_id/payment_id)` for tenant isolation and fast partition-level operations.
+**payments** — Full payment fields:
+
+`tenant_id, payment_id, loan_id, loan_type, installment_number, payment_date, actual_payment_date, scheduled_payment_date, original_payment_date, payment_amount, principal_component, interest_component, kkdf_component, bsmv_component, installment_status, remaining_principal, remaining_interest, remaining_kkdf, remaining_bsmv, synced_at`
+
+Both tables use:
+- **Engine:** `MergeTree()`
+- **Partition:** `PARTITION BY tenant_id`
+- **Order By:** `(tenant_id, loan_type, loan_id)` / `(tenant_id, loan_type, payment_id)`
 
 ### Profiling Metrics
 
 | Category | Metrics |
 |---|---|
-| **Numeric** | Min, Max, Avg, StdDev (amount, interest_rate, days_past_due, payment_amount) |
-| **Categorical** | Unique count, Mode, Distribution (status, loan_type, customer_type, installment_status) |
-| **Quality** | Null date ratio, Zero rate ratio, Unknown status ratio |
+| **Numeric** | Min, Max, Avg, StdDev — (`amount`, `interest_rate`, `days_past_due`, `payment_amount`) |
+| **Categorical** | Unique count, Mode, Distribution — (`status`, `loan_type`, `customer_type`, `installment_status`) |
+| **Quality** | Null date ratio, zero interest rate ratio, `UNKNOWN` status ratio |
 
-Profiling data is visualized on the dashboard with Chart.js charts.
+Profiling results are visualized on the dashboard using **Chart.js**.
 
 ---
 
-## 11. Monitoring
+## 11. Monitoring & Observability
 
 | Service | Library | Metrics |
 |---|---|---|
-| **Django** | `django-prometheus` | HTTP request count/duration, DB queries |
-| **FastAPI** | `prometheus-fastapi-instrumentator` | HTTP request count/duration, response size, upload latency |
-| **ClickHouse** | Built-in exporter (:9363) | Query count, memory usage |
+| **Django Adapter** | `django-prometheus` | HTTP request count/duration, DB query metrics |
+| **FastAPI External Bank** | `prometheus-fastapi-instrumentator` | HTTP request count/duration, response size, upload latency |
+| **ClickHouse** | Built-in exporter (`:9363`) | Query count, memory usage |
 
-Prometheus scrapes all services every 15 seconds. Grafana dashboard (`fsec-overview.json`) provides panels for:
+Prometheus scrapes all services every **15 seconds**. The Grafana dashboard (`fsec-overview.json`) provides:
+
 - Service health and request rates
-- Response times (P50/P90/P99)
-- Error rates
-- Upload endpoint latency (granular buckets: 0.1s to 120s)
-- Upload file size
-- Upload success/error rate
-- ClickHouse metrics
+- P50 / P90 / P99 response times
+- Error rates (4xx / 5xx)
+- Upload endpoint latency and file size distribution
+- ClickHouse query and resource metrics
 
 ---
 
@@ -326,59 +391,60 @@ Prometheus scrapes all services every 15 seconds. Grafana dashboard (`fsec-overv
 
 ```
 tests/
-├── conftest.py                    # Shared fixtures
-├── unit/                          # Unit Tests
-│   ├── test_normalizer.py         # Date, rate, status normalization
-│   ├── test_validator.py          # Field validation, cross-file integrity
-│   └── test_authentication.py     # Auth backends, permissions
-└── integration/                   # Integration Tests
-    ├── test_api_auth.py           # JWT, session, me/my-tenants
-    ├── test_api_tenants.py        # CRUD, sync logs, dashboard data
-    ├── test_tenant_isolation.py   # 🔒 Tenant leakage tests (CRITICAL)
+├── conftest.py                    # Shared fixtures (users, tenants, auth clients)
+├── unit/
+│   ├── test_normalizer.py         # Date, interest rate, status normalization tests
+│   ├── test_validator.py          # Field validation, cross-file integrity tests
+│   └── test_authentication.py     # Auth backends, permission classes
+└── integration/
+    ├── test_api_auth.py           # JWT, session, me, my-tenants endpoints
+    ├── test_api_tenants.py        # Tenant CRUD, sync logs, dashboard data
+    ├── test_tenant_isolation.py   # 🔒 Tenant leakage tests (critical)
     ├── test_registration.py       # Registration flow
     ├── test_upload_csv.py         # CSV upload (web UI + API)
-    └── test_sync_pipeline.py      # Pipeline consistency & resilience
+    └── test_sync_pipeline.py      # Pipeline consistency and resilience tests
 ```
 
 ### Critical Test Scenarios
 
-- **Tenant Isolation:** BANK001 user must NEVER access BANK002 data. Tested across all endpoints with JWT, API Key, and Superuser scenarios.
-- **Loan Type Isolation:** Uploading RETAIL data then COMMERCIAL data — both must coexist. Uploading COMMERCIAL must NOT delete RETAIL (and vice versa).
-- **Consistency:** 1000 records + 2000 records = exactly 2000 records after sync (full replacement, not append).
-- **Resilience:** Invalid data or orphan payments must preserve existing production data.
+- **Tenant Isolation:** A BANK001 user must never be able to access BANK002 data on any endpoint. All JWT, API Key, and Superuser scenarios are tested.
+- **Loan Type Isolation:** Uploading RETAIL data followed by COMMERCIAL data — both must remain independently accessible. Uploading COMMERCIAL must not delete RETAIL (and vice versa).
+- **Consistency:** 1000 old records + 2000 new records → exactly **2000** records after sync (replace, not append).
+- **Resilience:** In the event of invalid data or orphan payments, the production ClickHouse data must remain untouched.
 
 ---
 
-## 13. Infrastructure
+## 13. Infrastructure & Docker Compose
 
-### Docker Compose Services (10 total)
+### Services
 
 | Service | Container | Ports | Description |
 |---|---|---|---|
-| MinIO (S3) | `minio_s3` | 9002 → 9000, 9001 | S3-compatible object storage for CSV files |
-| External Bank | `external_bank_api` | 8001 → 8000 | FastAPI + PostgreSQL + MinIO |
-| PostgreSQL | `postgres_db` | 5432 | Shared by Django and External Bank |
-| Redis | `redis_broker` | 6379 | Celery broker/backend |
+| External Bank | `external_bank_api` | 8001 → 8000 | FastAPI + PostgreSQL client |
+| PostgreSQL | `postgres_db` | 5432 | Shared DB for Django and External Bank |
+| Redis | `redis_broker` | 6379 | Celery broker / result backend |
 | ClickHouse | `clickhouse_dw` | 8123, 9000, 9363 | OLAP data warehouse |
-| Django Adapter | `django_adapter` | 8000 | SaaS platform API + web UI |
+| Django Adapter | `django_adapter` | 8000 | SaaS API + web UI |
 | Celery Worker | `celery_worker` | — | Background sync tasks (4 workers) |
 | Celery Beat | `celery_beat` | — | Periodic task scheduler |
-| Prometheus | `prometheus` | 9090 | Metrics collection |
-| Grafana | `grafana` | 3000 | Dashboards & visualization |
+| Prometheus | `prometheus` | 9090 | Metrics collector |
+| Grafana | `grafana` | 3000 | Dashboard interface |
 
-All services communicate over `fsec_network` (bridge driver). A shared `entrypoint.sh` handles PostgreSQL readiness check, Django migrations, and server startup (Gunicorn in production, runserver in development).
+All services communicate over `fsec_network` (bridge driver). The shared `entrypoint.sh` script:
+
+1. Waits for PostgreSQL to be ready.
+2. Runs Django migrations.
+3. Starts `runserver` in development or `gunicorn` in production.
 
 ### Service Dependencies
 
 ```
-MinIO ─────────────┐
-PostgreSQL ────────┼──► External Bank API
-                   │
-MinIO ─────────────┤
-PostgreSQL ────────┤
-ClickHouse ────────┼──► Django Adapter / Celery Worker
-Redis ─────────────┤
-External Bank ─────┘
+PostgreSQL ──────────────────────────┐
+                                     ├──► External Bank API
+PostgreSQL ──────────────────────────┤
+ClickHouse ──────────────────────────┤──► Django Adapter / Celery Worker
+Redis ───────────────────────────────┤
+External Bank ───────────────────────┘
 ```
 
 ---
@@ -393,63 +459,59 @@ Tenant (tenant_id, name, api_key, is_active, loan_types, last_sync_at)
     ├── TenantMembership (user_id FK, tenant_id FK, role, is_default)
     │       └── User (Django built-in)
     │
-    ├── SyncState (file_type, loan_type, last_version, last_checksum)
+    ├── SyncState (file_type, loan_type, last_version, last_checksum, last_synced_at)
     │
-    └── SyncLog (file_type, loan_type, status, records_fetched/valid/invalid, error_message)
-            └── ValidationErrorLog (row_number, field_name, error_type, raw_value)
+    └── SyncLog (file_type, loan_type, status,
+                 version_before, version_after,
+                 records_fetched, records_valid, records_invalid,
+                 error_message, completed_at)
+            └── ValidationErrorLog (row_number, field_name,
+                                    error_type, error_message, raw_value)
 ```
 
-### PostgreSQL — External Bank (ext_bank schema)
+### PostgreSQL — External Bank (`ext_bank` schema)
 
 ```
-Loan (id, tenant_id, loan_account_number, loan_type, customer_id, customer_type,
-      loan_status_code, loan_status_flag, days_past_due,
-      loan_start_date, final_maturity_date, first_payment_date, loan_closing_date,
-      total_installment_count, outstanding_installment_count, paid_installment_count,
-      installment_frequency, grace_period_months,
-      original_loan_amount, outstanding_principal_balance,
-      nominal_interest_rate, total_interest_amount, kkdf_rate, kkdf_amount, bsmv_rate, bsmv_amount,
-      insurance_included, customer_district_code, customer_province_code, customer_region_code,
-      internal_rating, external_rating, loan_product_type, sector_code,
-      internal_credit_rating, default_probability, risk_class, customer_segment,
-      created_at)
-    └── Unique: (tenant_id, loan_account_number, loan_type)
+Loan (
+    id, tenant_id, loan_account_number, loan_type,
+    customer_id, customer_type,
+    loan_status_code, loan_status_flag, days_past_due,
+    loan_start_date, final_maturity_date, first_payment_date, loan_closing_date,
+    total_installment_count, outstanding_installment_count, paid_installment_count,
+    installment_frequency, grace_period_months,
+    original_loan_amount, outstanding_principal_balance,
+    nominal_interest_rate, total_interest_amount,
+    kkdf_rate, kkdf_amount, bsmv_rate, bsmv_amount,
+    insurance_included,
+    customer_district_code, customer_province_code, customer_region_code,
+    internal_rating, external_rating,
+    loan_product_type, sector_code,
+    internal_credit_rating, default_probability, risk_class, customer_segment,
+    created_at
+)
+  Unique: (tenant_id, loan_account_number, loan_type)
 
-Payment (id, tenant_id, payment_id, loan_account_number, loan_type, installment_number,
-         actual_payment_date, scheduled_payment_date,
-         installment_amount, principal_component, interest_component,
-         kkdf_component, bsmv_component, installment_status,
-         remaining_principal, remaining_interest, remaining_kkdf, remaining_bsmv,
-         created_at)
-    └── Unique: (tenant_id, payment_id, loan_type)
+Payment (
+    id, tenant_id, payment_id, loan_account_number, loan_type,
+    installment_number,
+    actual_payment_date, scheduled_payment_date,
+    installment_amount, principal_component, interest_component,
+    kkdf_component, bsmv_component, installment_status,
+    remaining_principal, remaining_interest, remaining_kkdf, remaining_bsmv,
+    created_at
+)
+  Unique: (tenant_id, payment_id, loan_type)
 
-DataVersion (id, tenant_id, file_type, loan_type, version, record_count,
-             last_updated, checksum, minio_object_key)
-    └── Unique: (tenant_id, file_type, loan_type)
+DataVersion (
+    id, tenant_id, file_type, loan_type,
+    version, record_count, last_updated, checksum
+)
+  Unique: (tenant_id, file_type, loan_type)
 
-FileUpload (id, tenant_id, file_type, loan_type, version, filename,
-            minio_object_key, file_size, record_count, checksum, uploaded_at)
-```
-
-### MinIO (S3 Object Storage)
-
-```
-fsec-data/                          # Bucket
-├── BANK001/
-│   ├── loans/
-│   │   ├── RETAIL/
-│   │   │   └── v2_retail_credit.csv
-│   │   └── COMMERCIAL/
-│   │       └── v1_commercial_credit.csv
-│   └── payments/
-│       ├── RETAIL/
-│       │   └── v1_retail_payments.csv
-│       └── COMMERCIAL/
-│           └── v1_commercial_payments.csv
-├── BANK002/
-│   └── ...
-└── BANK003/
-    └── ...
+FileUpload (
+    id, tenant_id, file_type, loan_type, version,
+    filename, file_size, record_count, checksum, uploaded_at
+)
 ```
 
 ---
@@ -461,41 +523,42 @@ fsec-data/                          # Bucket
 | Path | Description |
 |---|---|
 | `/` | Dashboard |
-| `/login/` | Login |
+| `/login/` | Login form |
 | `/register/` | User + tenant registration |
-| `/upload/` | CSV upload |
-| `/data/` | Data Explorer |
+| `/upload/` | CSV upload form |
+| `/data/` | Data explorer for ClickHouse records |
 
-### REST API
+### Adapter REST API
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/tenants/` | List tenants |
+| `GET` | `/api/tenants/` | Tenant list (filtered by user access) |
 | `GET` | `/api/tenants/{id}/` | Tenant detail |
-| `GET` | `/api/sync-logs/` | Sync logs |
-| `POST` | `/api/trigger-sync/` | Manual sync trigger |
-| `GET` | `/api/dashboard-data/` | Dashboard profiling data |
-| `POST` | `/api/upload-csv/` | CSV upload (API) |
-| `GET` | `/api/data-tables/` | Paginated ClickHouse data |
+| `GET` | `/api/tenants/{id}/sync_states/` | All SyncState records for a tenant |
+| `GET` | `/api/tenants/{id}/sync_logs/` | Sync history for a tenant |
+| `GET` | `/api/sync-logs/` | SyncLog list |
+| `POST` | `/api/trigger-sync/` | Manual sync trigger (rate-limited) |
+| `GET` | `/api/dashboard-data/` | Aggregated summary and profiling for dashboard |
+| `POST` | `/api/upload-csv/` | CSV upload via API (tenant membership required) |
+| `GET` | `/api/data-tables/` | Paginated ClickHouse loans/payments records |
 
 ### Auth API
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/auth/token/` | Obtain JWT (username + password) |
-| `POST` | `/api/auth/token/refresh/` | Refresh JWT |
-| `GET` | `/api/auth/me/` | Current user info |
-| `GET` | `/api/auth/my-tenants/` | User's tenant memberships |
+| `POST` | `/api/auth/token/` | Obtain JWT access + refresh tokens |
+| `POST` | `/api/auth/token/refresh/` | Refresh JWT access token |
+| `GET` | `/api/auth/me/` | Current user profile + tenant info |
+| `GET` | `/api/auth/my-tenants/` | List of tenants accessible to the current user |
 
 ### External Bank API
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/upload` | Upload CSV → MinIO + PostgreSQL |
-| `GET` | `/data` | Query records (cursor-based pagination via `after_id`) |
-| `GET` | `/version` | Version info (includes `minio_object_key`) |
-| `GET` | `/files/download` | Get presigned MinIO download URL |
-| `GET` | `/tenants` | List tenants |
+| `POST` | `/upload` | CSV upload → PostgreSQL (ext_bank) |
+| `GET` | `/data` | JSON data (cursor-based pagination via `after_id`) |
+| `GET` | `/version` | Version info for a tenant (version, checksum, record_count) |
+| `GET` | `/tenants` | List of registered tenants |
 | `GET` | `/health` | Health check |
 
 ---
@@ -504,19 +567,37 @@ fsec-data/                          # Bucket
 
 | Scenario | System Behavior | Data State |
 |---|---|---|
-| External Bank API unreachable | Celery retries 2x, SyncLog → `failed` | Preserved |
-| MinIO download fails | Falls back to /data API (cursor pagination) | Preserved |
-| Invalid field values in CSV | Entire batch rejected, logged to `ValidationErrorLog` | Preserved |
-| Orphan payments detected | Cross-file check fails, sync aborted | Preserved |
-| ClickHouse staging load error | Staging table dropped | Preserved |
-| ClickHouse swap error | Staging cleaned up, error logged | Preserved |
-| Concurrent sync for same tenant | Second task skipped (concurrency guard) | Preserved |
-| All retries exhausted | Stuck SyncLogs marked as `failed` automatically | Preserved |
-| Tenant not found (CSV upload) | HTTP 404 returned | — |
-| Unauthorized access | HTTP 401/403 returned | — |
+| External Bank API unreachable | Celery retries 2x, then SyncLog → `failed` | ClickHouse data preserved |
+| Error while fetching data (/data) | Sync task logs error, status → `failed` | ClickHouse data preserved |
+| Invalid field values in CSV | Validation errors written to `ValidationErrorLog`, sync aborted | ClickHouse data preserved |
+| Orphan payments detected | Cross-file check fails → sync fully aborted | ClickHouse data preserved |
+| Staging load error | Staging table is dropped | Production table preserved |
+| Atomic swap error | Staging cleaned up, error logged | Production table preserved |
+| Concurrent sync for same tenant | Concurrency guard: second job does not start | Production table preserved |
+| All retries exhausted | Stuck `running` SyncLogs are marked as `failed` | Production table preserved |
+| Unauthorized access | HTTP 401 / 403 returned | — |
+| Tenant not found (upload) | HTTP 404 returned | — |
 
-**Celery Retry Policy:** `max_retries=2`, `default_retry_delay=30s`. After all retries are exhausted, any stuck `SyncLog` entries in "running" state are automatically marked as "failed".
+**Celery Retry Policy:** `max_retries=2`, `default_retry_delay=30s`. After all retries are exhausted, any `SyncLog` entries stuck in the `running` state are automatically marked as `failed`.
 
 ---
 
-> This document covers the current architecture (v3 — PostgreSQL + MinIO), design decisions, and implementation details of the FSec platform. It should be updated as the project evolves.
+## 17. Possible Future Improvements
+
+Although not implemented in the current version, the system design allows integration of AI-based components to improve data quality and analysis.
+
+### AI-assisted Normalization
+
+An LLM could be used to normalize unknown categorical values (e.g. `"Kapalı"`, `"Closed"`, `"Paid"`) into canonical representations. This would reduce the need for manually maintained status mapping tables and handle edge cases in multilingual datasets more gracefully.
+
+### AI-based Anomaly Detection
+
+Machine learning models could detect abnormal financial records (e.g. unrealistic interest rates, negative loan amounts, or implausible days-past-due values). These models could run as a post-validation step in the sync pipeline and flag suspicious records for manual review rather than blocking the entire sync.
+
+### AI-driven Data Insights
+
+Profiling results could be summarized automatically using LLMs to provide human-readable insights for analysts. Instead of raw statistics, the dashboard could surface plain-language summaries such as _"RETAIL loan portfolio shows a 12% increase in default rate compared to the previous version"_.
+
+---
+
+> This document describes the current architecture of the FSec platform **(v4 — PostgreSQL-based External Bank + ClickHouse Data Warehouse)**, its security design, and data flow. It should be updated as the system evolves.

@@ -8,28 +8,26 @@ Multi-tenant SaaS platform that integrates with external banking systems, valida
 |---|---|
 | SaaS Platform & Frontend | Django 4.2, Django REST Framework, Tailwind CSS |
 | External Bank Simulation | FastAPI, PostgreSQL (shared, multi-tenant) |
-| Object Storage | MinIO (S3-compatible) — CSV file storage & presigned URLs |
 | Metadata DB | PostgreSQL 15 (shared by Django + External Bank) |
 | Data Warehouse (OLAP) | ClickHouse |
 | Task Queue | Celery + Celery Beat + Redis |
 | Auth | JWT, API Key, Session |
 | Monitoring | Prometheus, Grafana |
-| Infrastructure | Docker, Docker Compose (10 services) |
+| Infrastructure | Docker, Docker Compose (9 services) |
 
 ## Project Structure
 
 ```
-├── external_bank/        # Simulated Bank API (FastAPI + PostgreSQL + MinIO)
-│   ├── main.py           #   API endpoints (upload, data, version, files/download)
+├── external_bank/        # Simulated Bank API (FastAPI + PostgreSQL)
+│   ├── main.py           #   API endpoints (upload, data, version)
 │   ├── models.py         #   SQLAlchemy models (multi-tenant via tenant_id)
 │   ├── db.py             #   PostgreSQL connection manager (ext_bank schema)
-│   ├── minio_client.py   #   MinIO S3 operations (upload, presigned URLs)
 │   └── schemas.py        #   Pydantic request/response schemas
 ├── adapter/              # Business Logic Layer
 │   ├── core/             #   Normalizer & Validator
 │   ├── warehouse/        #   ClickHouse client & atomic ops (loan_type-aware)
 │   ├── tasks/            #   Celery background tasks (with concurrency guard)
-│   └── sync_service.py   #   Orchestrator (MinIO download + fallback pagination)
+│   └── sync_service.py   #   Orchestrator (JSON cursor pagination)
 ├── api/                  # Django Application
 │   ├── core/             #   Settings, URLs, Celery, WSGI
 │   ├── tenants/          #   Models, Views, Auth, Permissions
@@ -37,7 +35,7 @@ Multi-tenant SaaS platform that integrates with external banking systems, valida
 │   └── tests/            #   Unit & Integration tests
 ├── monitoring/           # Prometheus & Grafana configs
 ├── mock_data/            # Sample CSV files (retail + commercial)
-├── docker-compose.yml    # Dev orchestration (10 services)
+├── docker-compose.yml    # Dev orchestration (9 services)
 └── Architecture.md       # Detailed architecture doc
 ```
 
@@ -64,7 +62,7 @@ Edit the `.env` file to set your own passwords. Default values work out of the b
 docker compose up --build -d
 ```
 
-This spins up 10 services: MinIO, External Bank, PostgreSQL, Redis, ClickHouse, Django, Celery Worker, Celery Beat, Prometheus, and Grafana.
+This spins up 9 services: External Bank, PostgreSQL, Redis, ClickHouse, Django, Celery Worker, Celery Beat, Prometheus, and Grafana.
 
 ### 3. Create Superuser
 
@@ -78,7 +76,6 @@ docker exec -it django_adapter python manage.py createsuperuser
 |---|---|---|
 | **Dashboard** | http://localhost:8000 | Superuser credentials |
 | **External Bank API** | http://localhost:8001/docs | — |
-| **MinIO Console** | http://localhost:9001 | `fsec_minio` / `fsec_minio_secret_2026` |
 | **Grafana** | http://localhost:3000 | `admin` / `admin` |
 | **Prometheus** | http://localhost:9090 | — |
 | **Django Admin** | http://localhost:8000/admin/ | Superuser credentials |
@@ -90,13 +87,13 @@ docker exec -it django_adapter python manage.py createsuperuser
 1. Navigate to the **Upload CSV** page from the dashboard
 2. Select a tenant, file type (loans/payments), and loan type (RETAIL / COMMERCIAL)
 3. Upload your CSV file (both `,` and `;` delimiters are supported)
-4. Files are streamed to MinIO and records are bulk-inserted into PostgreSQL
+4. Records are bulk-inserted directly into PostgreSQL (ext_bank schema)
 5. Large files (200MB+) are handled with streaming I/O and dynamic timeouts
 
 ### Data Sync
 
 Celery Beat checks the External Bank API every 5 minutes for new data. The sync pipeline:
-1. Downloads CSV from MinIO via presigned URL (fast, streaming)
+1. Fetches records from External Bank via JSON cursor pagination
 2. Validates all records (field-level + cross-file integrity)
 3. Normalizes in 100K-record batches (memory-efficient)
 4. Loads into ClickHouse via staging table
@@ -171,8 +168,7 @@ ENVIRONMENT=production
 DEBUG=False
 DJANGO_SECRET_KEY=<random-64-char-string>
 ALLOWED_HOSTS=your-domain.com
-MINIO_ROOT_USER=<strong-minio-user>
-MINIO_ROOT_PASSWORD=<strong-minio-password>
+
 ```
 
 ## Stopping Services
