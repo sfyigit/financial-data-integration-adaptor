@@ -11,7 +11,7 @@ Multi-tenant SaaS platform that integrates with external banking systems, valida
 | Metadata DB | PostgreSQL 15 (shared by Django + External Bank) |
 | Data Warehouse (OLAP) | ClickHouse |
 | Task Queue | Celery + Celery Beat + Redis |
-| Auth | JWT, API Key, Session |
+| Auth | JWT, API Key (Django + External Bank), Session |
 | Monitoring | Prometheus, Grafana |
 | Infrastructure | Docker, Docker Compose (9 services) |
 
@@ -22,6 +22,8 @@ Multi-tenant SaaS platform that integrates with external banking systems, valida
 │   ├── main.py           #   API endpoints (upload, data, version)
 │   ├── models.py         #   SQLAlchemy models (multi-tenant via tenant_id)
 │   ├── db.py             #   PostgreSQL connection manager (ext_bank schema)
+│   ├── auth.py           #   X-API-KEY authentication
+│   ├── manage_api_keys.py#   CLI tool for API key management
 │   └── schemas.py        #   Pydantic request/response schemas
 ├── adapter/              # Business Logic Layer
 │   ├── core/             #   Normalizer & Validator
@@ -64,13 +66,35 @@ docker compose up --build -d
 
 This spins up 9 services: External Bank, PostgreSQL, Redis, ClickHouse, Django, Celery Worker, Celery Beat, Prometheus, and Grafana.
 
-### 3. Create Superuser
+### 3. Create External Bank API Key
+
+The External Bank API requires authentication via `X-API-KEY` header. Create an API key for the Django adapter:
+
+```bash
+docker exec external_bank_api python manage_api_keys.py create \
+    --service "django_adapter" \
+    --description "SaaS sync service"
+```
+
+Copy the generated key and add it to your `.env` file:
+
+```env
+EXTERNAL_BANK_API_KEY=fsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Then restart the Django services to pick up the new key:
+
+```bash
+docker compose restart adapter_api celery_worker celery_beat
+```
+
+### 5. Create Superuser
 
 ```bash
 docker exec -it django_adapter python manage.py createsuperuser
 ```
 
-### 4. Access
+### 6. Access
 
 | Service | URL | Credentials |
 |---|---|---|
@@ -79,6 +103,24 @@ docker exec -it django_adapter python manage.py createsuperuser
 | **Grafana** | http://localhost:3000 | `admin` / `admin` |
 | **Prometheus** | http://localhost:9090 | — |
 | **Django Admin** | http://localhost:8000/admin/ | Superuser credentials |
+
+### API Key Management
+
+Manage External Bank API keys using the CLI tool:
+
+```bash
+# List all API keys
+docker exec external_bank_api python manage_api_keys.py list
+
+# Deactivate an API key
+docker exec external_bank_api python manage_api_keys.py deactivate --key "fsec_abc123..."
+
+# Reactivate an API key
+docker exec external_bank_api python manage_api_keys.py activate --key "fsec_abc123..."
+
+# Delete an API key permanently
+docker exec external_bank_api python manage_api_keys.py delete --key "fsec_abc123..."
+```
 
 ## Usage
 
@@ -168,7 +210,7 @@ ENVIRONMENT=production
 DEBUG=False
 DJANGO_SECRET_KEY=<random-64-char-string>
 ALLOWED_HOSTS=your-domain.com
-
+EXTERNAL_BANK_API_KEY=<generated-api-key>
 ```
 
 ## Stopping Services

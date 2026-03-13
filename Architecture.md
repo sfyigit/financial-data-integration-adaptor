@@ -81,13 +81,15 @@
 
 Simulates an external banking system. Uses a single PostgreSQL database with a multi-tenant structure under the `ext_bank` schema. The CSV upload endpoint writes data directly to PostgreSQL.
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/upload` | CSV upload → PostgreSQL (ext_bank) |
-| `GET` | `/data` | JSON data (cursor-based pagination via `after_id`) |
-| `GET` | `/version` | Version info for a tenant (version, checksum, record_count) |
-| `GET` | `/tenants` | List of registered tenants |
-| `GET` | `/health` | Health check |
+**Authentication:** All data endpoints require `X-API-KEY` header. API keys are stored in `ext_bank.api_keys` table and managed via the `manage_api_keys.py` CLI tool.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/upload` | 🔐 | CSV upload → PostgreSQL (ext_bank) |
+| `GET` | `/data` | 🔐 | JSON data (cursor-based pagination via `after_id`) |
+| `GET` | `/version` | 🔐 | Version info for a tenant (version, checksum, record_count) |
+| `GET` | `/tenants` | 🔐 | List of registered tenants |
+| `GET` | `/health` | — | Health check (public) |
 
 **Upload flow:**
 1. CSV file is read and rows are parsed.
@@ -199,13 +201,37 @@ For each new version: run_sync_for_tenant(tenant_id) [Celery task]
 
 ## 6. Authentication & Authorization
 
-The system supports three authentication mechanisms simultaneously:
+The system supports multiple authentication mechanisms across different services:
+
+### Django Adapter API
 
 | Method | Use Case | Mechanism |
 |---|---|---|
 | **JWT** | Programmatic API access | `Authorization: Bearer <token>` |
 | **API Key** | Machine-to-machine (M2M) | `X-API-Key: <tenant-api-key>` |
 | **Session** | Web UI (dashboard & forms) | Django session cookie + CSRF |
+
+### External Bank API
+
+| Method | Use Case | Mechanism |
+|---|---|---|
+| **API Key** | Service-to-service auth | `X-API-KEY: <service-api-key>` |
+
+The External Bank API requires authentication for all data endpoints (`/upload`, `/data`, `/version`, `/tenants`). Only `/health` and `/metrics` endpoints remain public for monitoring purposes.
+
+API keys are stored in the `ext_bank.api_keys` table and can be managed via CLI:
+
+```bash
+# Create a new API key
+docker exec external_bank_api python manage_api_keys.py create \
+    --service "django_adapter" --description "SaaS sync service"
+
+# List all keys
+docker exec external_bank_api python manage_api_keys.py list
+
+# Deactivate/activate/delete keys
+docker exec external_bank_api python manage_api_keys.py deactivate --key "fsec_..."
+```
 
 - **JWT**:
   - Access token: 2 hours by default (configurable via env).
@@ -512,6 +538,13 @@ FileUpload (
     id, tenant_id, file_type, loan_type, version,
     filename, file_size, record_count, checksum, uploaded_at
 )
+
+ApiKey (
+    id, api_key, key_prefix, service_name, description,
+    is_active, created_at, last_used_at
+)
+  Unique: (api_key)
+  Index: (service_name)
 ```
 
 ---
@@ -553,13 +586,16 @@ FileUpload (
 
 ### External Bank API
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/upload` | CSV upload → PostgreSQL (ext_bank) |
-| `GET` | `/data` | JSON data (cursor-based pagination via `after_id`) |
-| `GET` | `/version` | Version info for a tenant (version, checksum, record_count) |
-| `GET` | `/tenants` | List of registered tenants |
-| `GET` | `/health` | Health check |
+All data endpoints require `X-API-KEY` header authentication. Only `/health` and `/metrics` are public.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `POST` | `/upload` | 🔐 | CSV upload → PostgreSQL (ext_bank) |
+| `GET` | `/data` | 🔐 | JSON data (cursor-based pagination via `after_id`) |
+| `GET` | `/version` | 🔐 | Version info for a tenant (version, checksum, record_count) |
+| `GET` | `/tenants` | 🔐 | List of registered tenants |
+| `GET` | `/health` | — | Health check (public) |
+| `GET` | `/metrics` | — | Prometheus metrics (public) |
 
 ---
 
@@ -584,7 +620,11 @@ FileUpload (
 
 ## 17. Possible Future Improvements
 
-Although not implemented in the current version, the system design allows integration of AI-based components to improve data quality and analysis.
+Although not implemented in the current version, the system design allows for several enhancements.
+
+### IP Whitelisting for External Bank API
+
+The External Bank API authentication module includes a TODO placeholder for IP whitelisting. This would add an additional security layer by restricting API access to specific IP addresses or CIDR ranges (e.g., only allowing requests from the Django Adapter container's IP).
 
 ### AI-assisted Normalization
 
