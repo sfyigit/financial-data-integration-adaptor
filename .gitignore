@@ -21,6 +21,8 @@ build/
 db.sqlite3
 staticfiles/
 media/
+mock_data/
+test_data/
 
 # --- External Bank Data ---
 external_bank/database/*.sqlite

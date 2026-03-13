@@ -14,7 +14,7 @@ Expanded to support full Turkish banking credit portfolio fields:
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Float, Integer, DateTime, Text,
-    Index, UniqueConstraint, BigInteger,
+    Index, UniqueConstraint, BigInteger, Boolean,
 )
 from sqlalchemy.orm import DeclarativeBase
 
@@ -200,3 +200,42 @@ class FileUpload(Base):
     record_count = Column(Integer, nullable=True)
     checksum = Column(String(64), nullable=True)
     uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ApiKey(Base):
+    """
+    API Key storage for SaaS service authentication.
+    Each SaaS service that needs to access the External Bank API
+    should have its own API key stored here.
+    
+    The key is stored as plain text for simplicity. In a production
+    environment with higher security requirements, consider storing
+    a hash of the key instead.
+    """
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        UniqueConstraint("api_key", name="uq_api_key"),
+        Index("ix_api_keys_service", "service_name"),
+        {"schema": SCHEMA},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    
+    # The actual API key value
+    api_key = Column(String(128), nullable=False, unique=True)
+    
+    # First 8 characters for easy identification (e.g., "fsec_abc...")
+    key_prefix = Column(String(12), nullable=False)
+    
+    # Name of the service using this key (e.g., "django_adapter", "sync_service")
+    service_name = Column(String(100), nullable=False)
+    
+    # Optional description
+    description = Column(String(500), nullable=True)
+    
+    # Whether this key is active
+    is_active = Column(Boolean, default=True, nullable=False)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_used_at = Column(DateTime, nullable=True)

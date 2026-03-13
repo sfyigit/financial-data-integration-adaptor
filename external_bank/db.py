@@ -10,7 +10,8 @@ import os
 import logging
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
-from models import Base
+# Import all models to register them with Base.metadata before create_all()
+from models import Base, Loan, Payment, DataVersion, FileUpload, ApiKey
 
 logger = logging.getLogger("external_bank.db")
 

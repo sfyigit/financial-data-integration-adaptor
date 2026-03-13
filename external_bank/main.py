@@ -24,13 +24,14 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 from psycopg2.extras import execute_values
 
 from sqlalchemy import text
 from models import Loan, Payment, DataVersion, FileUpload
+from auth import verify_api_key, AuthenticatedService
 from schemas import (
     UploadResponse, DataResponse, VersionResponse,
     TenantListResponse, HealthResponse, ErrorResponse,
@@ -142,6 +143,7 @@ async def upload_csv(
     tenant_id: str = Query(..., description="Bank/Tenant identifier (e.g., BANK001)"),
     file_type: str = Query(..., description="File type: 'loans' or 'payments'"),
     loan_type: str = Query(..., description="Loan type: 'RETAIL' or 'COMMERCIAL'"),
+    authenticated_service: AuthenticatedService = Depends(verify_api_key),
 ):
     """
     Upload a CSV file to store bank data.
@@ -425,6 +427,7 @@ async def get_data(
     limit: Optional[int] = Query(None, ge=1, description="Maximum number of records to return"),
     offset: Optional[int] = Query(None, ge=0, description="Number of records to skip (pagination)"),
     after_id: Optional[int] = Query(None, ge=0, description="Cursor: return records with id > after_id"),
+    authenticated_service: AuthenticatedService = Depends(verify_api_key),
 ):
     """
     Returns the stored data for a specific tenant as JSON.
@@ -490,6 +493,7 @@ async def get_data(
 @app.get("/version", response_model=VersionResponse)
 async def get_version(
     tenant_id: str = Query(..., description="Bank/Tenant identifier (e.g., BANK001)"),
+    authenticated_service: AuthenticatedService = Depends(verify_api_key),
 ):
     """
     Returns all data versions for a tenant.
@@ -513,7 +517,7 @@ async def get_version(
 
 
 @app.get("/tenants", response_model=TenantListResponse)
-async def get_tenants():
+async def get_tenants(authenticated_service: AuthenticatedService = Depends(verify_api_key)):
     """Lists all registered tenants (banks) in the system."""
     tenants = list_tenants()
     return TenantListResponse(tenants=tenants, count=len(tenants))

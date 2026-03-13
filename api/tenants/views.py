@@ -9,8 +9,20 @@ All API endpoints enforce tenant isolation:
 """
 
 import logging
+import os
 import requests as http_requests
 from django.conf import settings
+
+# API Key for External Bank authentication
+EXTERNAL_BANK_API_KEY = os.getenv("EXTERNAL_BANK_API_KEY", "")
+
+
+def _get_external_bank_headers() -> dict:
+    """Get headers for External Bank API requests including authentication."""
+    headers = {}
+    if EXTERNAL_BANK_API_KEY:
+        headers["X-API-KEY"] = EXTERNAL_BANK_API_KEY
+    return headers
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import render, get_object_or_404
 from django.utils import timezone
@@ -365,6 +377,9 @@ def upload_csv_page(request):
             LARGE_FILE_THRESHOLD = 200 * 1024 * 1024  # 200MB
             file_size = csv_file.size
 
+            # Get authentication headers for External Bank
+            auth_headers = _get_external_bank_headers()
+
             if file_size > LARGE_FILE_THRESHOLD:
                 # Large file: stream directly, generous timeout (~5s per MB for DB processing, min 600s)
                 upload_timeout = max(600, int(file_size / (1024 * 1024)) * 5)
@@ -380,6 +395,7 @@ def upload_csv_page(request):
                         "file_type": file_type,
                         "loan_type": loan_type,
                     },
+                    headers=auth_headers,
                     files={
                         "file": (csv_file.name, csv_file, "text/csv"),
                     },
@@ -395,6 +411,7 @@ def upload_csv_page(request):
                         "file_type": file_type,
                         "loan_type": loan_type,
                     },
+                    headers=auth_headers,
                     files={
                         "file": (csv_file.name, file_content, "text/csv"),
                     },
@@ -605,6 +622,7 @@ def api_upload_csv(request):
     # --- Forward to External Bank ---
     try:
         external_bank_url = settings.EXTERNAL_BANK_URL
+        auth_headers = _get_external_bank_headers()
 
         # Dynamic timeout & streaming for large files (200MB+)
         LARGE_FILE_THRESHOLD = 200 * 1024 * 1024  # 200MB
@@ -625,6 +643,7 @@ def api_upload_csv(request):
                     "file_type": file_type,
                     "loan_type": loan_type,
                 },
+                headers=auth_headers,
                 files={"file": (csv_file.name, csv_file, "text/csv")},
                 timeout=upload_timeout,
             )
@@ -637,6 +656,7 @@ def api_upload_csv(request):
                     "file_type": file_type,
                     "loan_type": loan_type,
                 },
+                headers=auth_headers,
                 files={"file": (csv_file.name, file_content, "text/csv")},
                 timeout=60,
             )

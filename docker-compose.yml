@@ -6,6 +6,7 @@ services:
     env_file: .env
     environment:
       - EXTERNAL_BANK_DB_URL=postgresql://${POSTGRES_USER:-fsec_user}:${POSTGRES_PASSWORD:-fsec_pg_pass_2026}@postgres_db:5432/${POSTGRES_DB:-fsec_db}
+      - EXTERNAL_BANK_API_KEY=${EXTERNAL_BANK_API_KEY:-}
     ports:
       - "8001:8000"
     restart: unless-stopped
@@ -105,6 +106,7 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
       - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+      - EXTERNAL_BANK_API_KEY=${EXTERNAL_BANK_API_KEY:-}
     depends_on:
       postgres_db:
         condition: service_healthy
@@ -136,6 +138,7 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
       - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+      - EXTERNAL_BANK_API_KEY=${EXTERNAL_BANK_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -165,6 +168,7 @@ services:
       - CLICKHOUSE_HOST=${CLICKHOUSE_HOST:-clickhouse}
       - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-clickhouse_secure_2026}
       - EXTERNAL_BANK_URL=${EXTERNAL_BANK_URL:-http://external_bank:8000}
+      - EXTERNAL_BANK_API_KEY=${EXTERNAL_BANK_API_KEY:-}
     depends_on:
       redis:
         condition: service_healthy

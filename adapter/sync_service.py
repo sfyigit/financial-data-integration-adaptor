@@ -21,6 +21,7 @@ Key improvements:
 """
 
 import logging
+import os
 from typing import Optional
 
 import requests
@@ -32,6 +33,9 @@ from adapter.core.validator import Validator, ValidationResult
 from adapter.warehouse.clickhouse_client import ClickHouseClient
 
 logger = logging.getLogger("adapter.sync_service")
+
+# API Key header name for External Bank authentication
+API_KEY_HEADER_NAME = "X-API-KEY"
 
 # Batch size for fetching data from External Bank API (JSON cursor pagination)
 CHUNK_SIZE = 50_000
@@ -49,12 +53,30 @@ class SyncService:
 
     def __init__(self):
         self.external_bank_url = getattr(settings, "EXTERNAL_BANK_URL", "http://external_bank:8000")
+        self.external_bank_api_key = os.getenv("EXTERNAL_BANK_API_KEY", "")
         self.ch_client = ClickHouseClient()
         # Ensure ClickHouse tables exist
         try:
             self.ch_client.initialize()
         except Exception as e:
             logger.warning(f"ClickHouse initialization warning: {e}")
+
+    def _get_auth_headers(self) -> dict:
+        """
+        Get authentication headers for External Bank API requests.
+        
+        Returns:
+            Dictionary with X-API-KEY header if configured.
+        """
+        headers = {}
+        if self.external_bank_api_key:
+            headers[API_KEY_HEADER_NAME] = self.external_bank_api_key
+        else:
+            logger.warning(
+                "EXTERNAL_BANK_API_KEY not configured. "
+                "Requests to External Bank may fail if authentication is required."
+            )
+        return headers
 
     def sync_tenant(
         self,
@@ -347,9 +369,10 @@ class SyncService:
         from tenants.models import Tenant, SyncState
 
         url = f"{self.external_bank_url}/version?tenant_id={tenant_id}"
+        headers = self._get_auth_headers()
 
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
@@ -398,6 +421,7 @@ class SyncService:
         all_records = []
         after_id = 0
         chunk_num = 0
+        headers = self._get_auth_headers()
 
         while True:
             chunk_num += 1
@@ -411,7 +435,7 @@ class SyncService:
             )
 
             try:
-                response = requests.get(url, timeout=FETCH_TIMEOUT)
+                response = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
                 response.raise_for_status()
                 data = response.json()
             except requests.RequestException as e:
